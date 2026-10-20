@@ -1,0 +1,7 @@
+# Extra dependencies to open and execute notebooks/RIIMA_method_walkthrough.ipynb.
+# Not required by the GUI or CLI. Install requirements.txt first, then this file.
+-r ../requirements.txt
+jupyter>=1.0
+nbformat>=5.9
+nbclient>=0.9
+ipykernel>=6.25

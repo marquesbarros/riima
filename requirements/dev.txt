@@ -1,0 +1,4 @@
+# Engineering tests, including execution of the shared-core notebook.
+-r ../requirements.txt
+pytest>=8,<10
+nbformat>=5.9

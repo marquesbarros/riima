@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Análises descritivas dos grupos segmentados</title>
+<style>
+${visual_style}
+* { box-sizing:border-box; }
+body { margin:0; font-family:var(--font-family); font-size:var(--font-body); background:var(--bg); color:var(--ink); line-height:1.55; overflow-wrap:anywhere; }
+.wrap { max-width:1280px; margin:0 auto; padding:var(--space-xl); }
+header { background:var(--card); color:var(--ink); padding:var(--space-xl); border:1px solid var(--line); border-top:4px solid var(--accent); border-radius:8px; }
+header h1 { margin:0 0 var(--space-md); font-size:var(--font-title); line-height:1.25; }
+header p { margin:var(--space-sm) 0 0; }
+a { color:var(--accent); text-underline-offset:3px; }
+a:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+nav { position:sticky; top:var(--space-sm); z-index:10; max-height:30vh; overflow-y:auto; margin:var(--space-lg) 0 var(--space-xl); display:flex; flex-wrap:wrap; gap:var(--space-sm); padding:var(--space-md); border:1px solid var(--line); border-radius:8px; background:var(--card); }
+nav a { display:flex; align-items:center; min-height:44px; padding:var(--space-sm) var(--space-md); border-radius:4px; font-size:var(--font-caption); line-height:1.4; }
+nav a:hover { background:var(--note); }
+.cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--space-lg); margin:var(--space-xl) 0; }
+.card { min-width:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:var(--space-lg); }
+.card .k { color:var(--muted); font-size:var(--font-caption); margin-bottom:var(--space-sm); }
+.card .v { font-size:var(--font-section); font-weight:700; line-height:1.3; margin-bottom:var(--space-sm); }
+.card .s { color:var(--muted); font-size:var(--font-caption); }
+h2 { font-size:var(--font-section); line-height:1.35; }
+.section-title { margin:calc(2 * var(--space-xl)) 0 var(--space-sm); }
+[id] { scroll-margin-top:calc(30vh + 2 * var(--space-md)); }
+.section-lead { margin:0 0 var(--space-lg); }
+.figure-card, .table-card { min-width:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:var(--space-lg); margin:var(--space-lg) 0; }
+.figure-card h2 { margin:0 0 var(--space-md); }
+.figure-head { margin-bottom:var(--space-md); }
+.figure-head .exp { margin:0 0 var(--space-sm); }
+.equation { display:inline-block; max-width:100%; background:var(--note); color:var(--ink); padding:var(--space-sm) var(--space-md); border-radius:4px; font-size:var(--font-body); margin-bottom:var(--space-sm); }
+img { display:block; width:100%; max-width:100%; height:auto; border:0; border-radius:0; box-shadow:none; }
+.figure-card img + img { margin-top:var(--space-lg); }
+.table-card h3 { margin:0 0 var(--space-sm); font-size:var(--font-body); }
+.table-card p { margin:0 0 var(--space-md); }
+table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:var(--font-table); }
+th, td { border-bottom:1px solid var(--line); padding:var(--space-sm) var(--space-md); text-align:left; vertical-align:top; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+th { background:var(--note); font-weight:700; }
+.two-col { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-lg); }
+.obs { background:var(--note); border-left:3px solid var(--accent); padding:var(--space-md) var(--space-lg); border-radius:4px; margin:var(--space-lg) 0 var(--space-sm); }
+footer { color:var(--muted); font-size:var(--font-caption); margin-top:var(--space-xl); }
+ul.ref-list { margin:var(--space-sm) 0 0 var(--space-xl); padding:0; }
+ul.ref-list li { margin:var(--space-sm) 0; }
+.legend { display:flex; flex-wrap:wrap; gap:var(--space-md) var(--space-xl); margin:var(--space-lg) 0; }
+.legend span { display:inline-flex; align-items:baseline; gap:var(--space-sm); min-width:0; max-width:100%; font-size:var(--font-caption); }
+.swatch { width:15px; height:15px; flex-shrink:0; border:1px solid var(--muted); display:inline-block; vertical-align:middle; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+.classification-map { max-height:900px; object-fit:contain; }
+.table-scroll { max-width:100%; overflow-x:auto; }
+.empty-note { color:var(--muted); }
+.analysis-info { overflow-wrap:anywhere; }
+@media (max-width:1100px) {
+  .cards { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .two-col { grid-template-columns:minmax(0,1fr); }
+}
+@media (max-width:760px) {
+  .wrap { padding:var(--space-md); }
+  header { padding:var(--space-lg); }
+  .cards { grid-template-columns:minmax(0,1fr); }
+  nav { padding:var(--space-sm); }
+  nav a { flex:1 1 180px; }
+  .figure-card, .table-card { padding:var(--space-md); }
+  .table-scroll table { min-width:640px; }
+}
+@media print {
+  @page { margin:16mm; }
+  body { background:white; color:var(--ink); font-size:11pt; }
+  .wrap { max-width:none; padding:0; }
+  nav { display:none; }
+  header { background:white; color:var(--ink); padding:var(--space-lg); border-top:1px solid var(--line); }
+  .cards { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .two-col { display:block; }
+  .card, .figure-card, .table-card, .obs { background:white; box-shadow:none; }
+  .figure-card, .table-card { break-inside:avoid; }
+  .classification-map { max-height:70mm; }
+  h2, h3, .figure-head { break-after:avoid; }
+  p, li { orphans:3; widows:3; }
+  img, tr, .card, .legend span { break-inside:avoid; }
+  .legend { break-before:avoid; break-inside:avoid; }
+  .swatch { print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+  .table-scroll { overflow:visible; }
+  .table-scroll table { min-width:0; }
+  table { font-size:9pt; }
+  th, td { padding:var(--space-sm); }
+  th { background:white; }
+  thead { display:table-header-group; }
+  .equation { background:white; padding-left:0; }
+  a, footer { color:var(--ink); }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Análises descritivas dos grupos segmentados</h1>
+  <p>Este documento reúne as análises descritivas geradas a partir da classificação atual no RIIMA, com ênfase na expressão areal dos grupos, na distribuição de tamanhos, no contraste entre atributos ópticos e geométricos, nas relações de similaridade e nos padrões direcionais observados.</p>
+  <p>As métricas apresentadas descrevem componentes conectados delimitados durante o processamento e devem ser lidas como suporte à interpretação integrada dos agrupamentos, contribuindo para a avaliação geológica e física da lâmina.</p>
+
+</header>
+  <nav><a href="#classificacao">Classificação analisada</a>
+    <a href="#tamanho">Representatividade e tamanho</a>
+    <a href="#descritores">Descritores dos grupos</a>
+    <a href="#similaridade">Similaridade multivariada</a>
+    <a href="#direcional">Direção e anisotropia</a>
+    <a href="#distribuicoes">Distribuições internas</a>
+    <a href="#complementares">Gráficos complementares</a>
+    <a href="#referencias">Referências</a>
+  </nav>
+
+<section class="cards">
+  <div class="card"><div class="k">Participação acumulada dos três grupos de maior área</div><div class="v">${area3}%</div><div class="s">${largest_groups}</div></div>
+  <div class="card"><div class="k">Maior coerência direcional média</div><div class="v">${highest_coh_group_name}</div><div class="s">Coerência = ${highest_coh_direction_coherence}; direção dominante = ${highest_coh_dominant_direction_deg}°</div></div>
+  <div class="card"><div class="k">Menor anisotropia geométrica média</div><div class="v">${lowest_aniso_group_name}</div><div class="s">Anisotropia média = ${lowest_aniso_mean_anisotropy}</div></div>
+  <div class="card"><div class="k">Par de grupos com maior similaridade multivariada</div><div class="v">${highest_sim_1}-${highest_sim_2}</div><div class="s">Similaridade = ${highest_sim_0}</div></div>
+</section>
+
+${classification}
+
+<h2 id="tamanho" class="section-title">1. Representatividade e tamanho dos grupos</h2>
+<p class="section-lead">Esta seção resume a expressão espacial dos grupos e sua organização em termos de número de regiões e escala típica dos componentes. Em conjunto, os gráficos permitem distinguir grupos dominantes em área, grupos compostos por muitas regiões pequenas e grupos formados por menos regiões relativamente maiores.</p>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 1A. Participação areal dos grupos (Russ, 2002; van der Walt et al., 2014). A figura mostra a fração de área ocupada por cada grupo na área válida da imagem e a curva acumulada correspondente. A curva ajuda a avaliar concentração de área em poucos grupos. Feito utilizando métricas de contagem e área de componentes conectados extraídas do processamento.</p><div class="equation">Área relativa (%) = 100 × pixels do grupo / pixels válidos</div></div>${fig1a}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 1B. Número de regiões e área mediana das regiões (Russ, 2002). A figura cruza a quantidade de regiões medidas com a área mediana das regiões de cada grupo. Trata-se de um resumo de textura: grupos com muitas regiões pequenas ocupam porções diferentes do espaço gráfico em relação a grupos com menos regiões maiores. O tamanho das bolhas é proporcional à participação areal do grupo. Feito utilizando estatísticas descritivas por grupo.</p></div>${fig1b}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 1C. Composição por classes de tamanho. A figura detalha a distribuição relativa de classes de área dentro de cada grupo, facilitando a leitura do predomínio de componentes muito pequenos, intermediários ou grandes. Feito utilizando histogramas categorizados por área de componente.</p></div>${fig1c}</section>
+
+<div class="table-card"><h3>Resumo numérico por grupo</h3><p>Valores de referência para leitura rápida das métricas principais.</p>${summary_table}</div>
+<div class="obs"><strong>Observação.</strong> A comparação entre área total, número de regiões e área mediana ajuda a separar grupos arealmente dominantes de grupos numericamente abundantes, mas compostos por elementos menores.</div>
+
+<h2 id="descritores" class="section-title">2. Variáveis que melhor descrevem cada grupo</h2>
+<p class="section-lead">Esta seção destaca os descritores que mais singularizam cada grupo e a capacidade global de separação dos atributos ópticos amostrados. O conjunto é útil para identificar quais propriedades mais contribuem para a distinção entre agrupamentos automáticos.</p>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 2. Descritores dominantes por grupo. Cada painel mostra os cinco descritores com maior desvio padronizado em relação à média entre grupos. Barras positivas indicam valores acima da média global; barras negativas indicam valores abaixo da média global. Como se trata de z-score, a comparação é relativa e não em unidades originais. Feito utilizando padronização z-score de métricas ópticas, geométricas e direcionais.</p><div class="equation">z = (x − μ) / σ</div></div>${fig2}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 3A. Capacidade global de separação dos atributos (Richardson, 2011). A figura resume o contraste entre grupos para cada atributo com base em η². Valores mais altos indicam maior separação descritiva entre os grupos no atributo correspondente. Feito utilizando η² calculado a partir das somas de quadrados entre e total.</p><div class="equation">η² = SQ entre grupos / SQ total</div></div>${fig3a}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 3B. Perfil padronizado dos grupos. O mapa de calor reúne, em uma única matriz, o posicionamento relativo dos grupos em atributos ópticos e morfológicos selecionados. Tons quentes indicam valores acima da média dos grupos e tons frios indicam valores abaixo. Feito utilizando matriz de z-scores por grupo.</p></div>${fig3b}</section>
+<div class="table-card"><h3>Descritores predominantes por grupo</h3><p>Resumo textual dos três descritores com maior contraste padronizado em cada grupo.</p><table><thead><tr><th>Grupo</th><th>Descritores predominantes</th></tr></thead><tbody>${rows_html}</tbody></table></div>
+<div class="obs"><strong>Observação.</strong> A leitura conjunta dos descritores específicos com o ranking de η² é útil para separar atributos globalmente discriminantes de atributos que, embora menos discriminantes no conjunto, tornam-se diagnósticos em grupos individuais.</div>
+
+<h2 id="similaridade" class="section-title">3. Similaridade multivariada entre grupos</h2>
+<p class="section-lead">A similaridade foi calculada a partir de um vetor integrado de métricas morfológicas, ópticas e direcionais padronizadas. O objetivo é representar proximidade descritiva entre grupos, sem impor interpretação mineralógica direta.</p>
+<div class="two-col">
+  <section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 4A. Dendrograma de similaridade (Ward, 1963). O dendrograma representa o agrupamento hierárquico com base na distância multivariada entre os perfis dos grupos. Feito utilizando distância euclidiana sobre variáveis padronizadas e ligação de Ward.</p><div class="equation">Distância euclidiana sobre variáveis padronizadas; ligação de Ward</div></div>${fig4a}</section>
+  <section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 4B. Matriz de similaridade. A matriz resume a afinidade entre grupos numa escala de 0 a 1. Valores mais altos indicam maior proximidade descritiva. Feito a partir da transformação do espaço de distâncias multivariadas em uma escala contínua de similaridade.</p><div class="equation">Similaridade = exp[−d² / (2σ²)]</div></div>${fig4b}</section>
+</div>
+<div class="obs"><strong>Observação.</strong> Pares mais semelhantes: ${most_sim}. Pares menos semelhantes: ${least_sim}.</div>
+
+<h2 id="direcional" class="section-title">4. Dados direcionais e anisotropia</h2>
+<p class="section-lead">Como as orientações são axiais em 2D, esta seção utiliza três formas complementares de representação: rosetas bilaterais para a distribuição angular, projeção circular adaptada para inspecionar concentração axial e diagrama tipo Flinn 2D para comparar forma e escala dos eixos das regiões.</p>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 5. Rosetas direcionais por grupo (Fisher, 1993; Mardia &amp; Jupp, 1999). As rosetas mostram a distribuição de orientação das regiões em representação bilateral. Os setores foram ponderados por anisotropia × √área para ampliar a influência de feições maiores e geometricamente mais orientadas. Em cada painel, C representa a coerência direcional média do grupo; a direção dominante θ aparece na tabela de direcionalidade. Feito utilizando estatística axial ponderada.</p><div class="equation">C e θ derivados da média axial ponderada por área × anisotropia</div></div>${fig5}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 6. Projeção axial tipo 2θ (Fisher, 1993; Mardia &amp; Jupp, 1999). A projeção usa ângulo dobrado (2θ), solução usual para dados axiais. A distância ao centro representa a anisotropia geométrica, e a seta mostra o vetor de coerência direcional do grupo. Feito utilizando transformação angular 2θ e projeção cartesiana.</p><div class="equation">x = A cos(2θ); y = A sin(2θ)</div></div>${fig6}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 7. Diagrama de eixos tipo Flinn 2D, inspirado na comparação de razões axiais (Flinn, 1962). O diagrama compara as medianas dos eixos maior e menor de cada grupo. As barras de erro mostram o intervalo interquartil, e as linhas tracejadas indicam razões axiais constantes. Feito a partir das estatísticas dos eixos das regiões conectadas; não calcula o diagrama X/Y versus Y/Z de deformação tridimensional.</p><div class="equation">Razão axial = eixo maior / eixo menor</div></div>${fig7}</section>
+<div class="obs"><strong>Observação.</strong> A interpretação conjunta entre roseta, coerência direcional, anisotropia média e posição no diagrama tipo Flinn permite distinguir grupos mais orientados, mais isotrópicos e mais alongados.</div>
+
+<h2 id="distribuicoes" class="section-title">5. Distribuições internas dos grupos</h2>
+<p class="section-lead">Os histogramas e as curvas kernel apresentam a estrutura interna dos grupos, evidenciando assimetria, concentração e possível multimodalidade. São particularmente úteis para avaliar heterogeneidade interna dos agrupamentos automáticos.</p>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 8. Distribuição das áreas dos componentes (Silverman, 1986; Scott, 1992). As áreas foram transformadas em log10 para reduzir assimetria de escala. A curva preta corresponde à densidade kernel e a linha tracejada marca a mediana. Feito utilizando histogramas e estimativa de densidade kernel gaussiana, com largura de banda pela regra de Scott.</p><div class="equation">x = log10(área em pixels)</div></div>${fig8}</section>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 9. Distribuição da anisotropia (Scott, 1992). A figura mostra a distribuição da anisotropia geométrica em cada grupo, com histograma, densidade kernel e mediana. Feito utilizando histogramas e densidade kernel gaussiana, com largura de banda pela regra de Scott.</p><div class="equation">Anisotropia = (λmax − λmin) / (λmax + λmin)</div></div>${fig9}</section>
+<div class="obs"><strong>Observação.</strong> Distribuições amplas ou multimodais sugerem heterogeneidade interna do grupo e podem indicar que o agrupamento automático reúne subpopulações distintas sob um mesmo rótulo.</div>
+
+<h2 id="complementares" class="section-title">6. Gráficos complementares</h2>
+<p class="section-lead">Os gráficos seguintes acrescentam parâmetros úteis para a representação final do processamento: compacidade, excentricidade e razão axial. Esses parâmetros favorecem a leitura da geometria interna dos agrupamentos e ajudam a sustentar decisões posteriores de natureza geológica ou física.</p>
+<section class="figure-card"><div class="figure-head"><p class="exp">Gráfico 10. Compacidade, excentricidade e razão axial (Russ, 2002). À esquerda, as barras mostram a compacidade mediana por grupo. À direita, a relação entre razão axial mediana e excentricidade mediana sintetiza o grau de alongamento geométrico dos grupos. Feito utilizando descritores geométricos clássicos de forma.</p><div class="equation">Compacidade = 4πA / P²</div></div>${fig10}</section>
+<div class="obs"><strong>Observação.</strong> A inclusão rotineira de compacidade, excentricidade e classes de tamanho tende a melhorar a interpretação de grupos que apresentem respostas ópticas semelhantes, mas geometrias distintas.</div>
+
+<h2 id="referencias" class="section-title">Referências</h2>
+<div class="table-card"><p>Referências metodológicas das análises e fontes preservadas do modelo original. A documentação de scikit-image serve como referência de medidas regionais; a biblioteca não é dependência de execução do RIIMA.</p>
+<ul class="ref-list">
+<li>Fisher, N. I. (1993). Statistical Analysis of Circular Data. Cambridge University Press. <a href="https://doi.org/10.1017/CBO9780511564345">DOI</a>.</li>
+<li>Flinn, D. (1962). On folding during three-dimensional progressive deformation. Quarterly Journal of the Geological Society of London, 118(1-4), 385-428. <a href="https://doi.org/10.1144/gsjgs.118.1.0385">DOI</a>.</li>
+<li>MacQueen, J. B. (1967). Some methods for classification and analysis of multivariate observations. Proceedings of the Fifth Berkeley Symposium on Mathematical Statistics and Probability, vol. 1, 281-297. <a href="https://digicoll.lib.berkeley.edu/record/113015?v=pdf">Acervo de Berkeley</a>.</li>
+<li>Mardia, K. V., &amp; Jupp, P. E. (1999/2000). Directional Statistics. Wiley. <a href="https://doi.org/10.1002/9780470316979">DOI</a>. Wiley registra publicação online e copyright em 1999; a edição impressa consta como 2000 no registro institucional de Jupp.</li>
+<li>Richardson, J. T. E. (2011). Eta squared and partial eta squared as measures of effect size in educational research. Educational Research Review, 6(2), 135-147. <a href="https://doi.org/10.1016/j.edurev.2010.12.001">DOI</a>.</li>
+<li>Russ, J. C. (2002). The Image Processing Handbook. 4. ed. CRC Press. ISBN 9780849311420.</li>
+<li>Scott, D. W. (1992). Multivariate Density Estimation: Theory, Practice, and Visualization. Wiley. <a href="https://doi.org/10.1002/9780470316849">DOI</a>.</li>
+<li>Silverman, B. W. (1986). Density Estimation for Statistics and Data Analysis. Chapman and Hall. ISBN 9780412246203.</li>
+<li>van der Walt, S., Schönberger, J. L., Nunez-Iglesias, J., et al. (2014). scikit-image: image processing in Python. PeerJ, 2, e453. <a href="https://doi.org/10.7717/peerj.453">DOI</a>; <a href="https://scikit-image.org/docs/stable/api/skimage.measure.html">regionprops</a>.</li>
+<li>Ward, J. H. Jr. (1963). Hierarchical grouping to optimize an objective function. Journal of the American Statistical Association, 58(301), 236-244. <a href="https://doi.org/10.1080/01621459.1963.10500845">DOI</a>.</li>
+</ul></div>
+
+<footer>
+  <p><strong>Metadados de cálculo.</strong> Área mínima para medição: ${min_component_area_px} px. Conectividade: ${connectivity}. Limite de regiões medidas por grupo/imagem: ${max_measured_regions_per_group_image}. Amostragem efetiva por grupo em análises de separação: ${effective_sample_per_group}.</p>
+${calculation_notes}
+</footer>
+</div>
+</body>
+</html>

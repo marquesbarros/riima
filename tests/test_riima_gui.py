@@ -1842,12 +1842,17 @@ def test_diagnostic_canvas_text_and_marks_are_legible(app):
 
 
 @pytest.mark.parametrize('geometry', ['1080x700', '1280x820'])
-def test_long_legend_label_wraps_inside_scrollable_viewport(app, geometry):
+@pytest.mark.parametrize('label_padding', [None, (16, 3, 12, 3)])
+def test_long_legend_label_wraps_inside_scrollable_viewport(app, geometry, label_padding):
     from tkinter import ttk
     root = app['root']
+    style = app['style']
     before = root.geometry()
+    before_padding = style.configure('TLabel', 'padding')
     long_label = 'Grupo de interpretação com nome muito extenso ' * 7
     try:
+        if label_padding is not None:
+            style.configure('TLabel', padding=label_padding)
         root.geometry(geometry)
         app['clear_legend']()
         app['_draw_legend_rows']('test', [dict(label=long_label, detail='Detalhes completos ' * 12, color=(120, 80, 220))])
@@ -1862,6 +1867,7 @@ def test_long_legend_label_wraps_inside_scrollable_viewport(app, geometry):
         assert labels[0].winfo_reqheight() > 30
         assert app['legend_canvas'].bbox('all')[3] >= labels[0].winfo_reqheight()
     finally:
+        style.configure('TLabel', padding=before_padding or '')
         root.geometry(before)
         app['draw_legend']()
 

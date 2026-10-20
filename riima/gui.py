@@ -884,16 +884,20 @@ def gui(_test_hook=None) -> None:
                 swatch.pack(side="left", padx=(0, 7), anchor="n")
             text = ttk.Frame(line)
             text.pack(side="left", fill="x", expand=True)
-            name = ttk.Label(text, text=row["label"], font=theme.font('body', bold=True),
+            name = ttk.Label(text, font=theme.font('body', bold=True),
                              wraplength=190, justify='left', anchor='w')
+            name_insets = name.winfo_reqwidth()
+            name.configure(text=row["label"])
             name.pack(anchor="w", fill='x')
-            detail = ttk.Label(text, text=row.get("detail", ""), wraplength=190,
+            detail = ttk.Label(text, wraplength=190,
                                foreground=theme.TEXT_SECONDARY, justify='left', anchor='w')
+            detail_insets = detail.winfo_reqwidth()
+            detail.configure(text=row.get("detail", ""))
             detail.pack(anchor="w", fill='x')
-            # Wrap by the allocated text column, keeping complete names in the
-            # vertical scroller even with a wide fallback font or long group name.
-            text.bind('<Configure>', lambda event, labels=(name, detail):
-                      [label.configure(wraplength=max(1, event.width)) for label in labels])
+            # Empty labels measure the active theme's borders and padding;
+            # wraplength applies only to the text area inside those insets.
+            text.bind('<Configure>', lambda event, labels=((name, name_insets), (detail, detail_insets)):
+                      [label.configure(wraplength=max(1, event.width - insets)) for label, insets in labels])
 
 
 

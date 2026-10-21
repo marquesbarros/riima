@@ -1,0 +1,292 @@
+{
+  "schema": "RIIMA-public-files-1",
+  "repository_metadata": {
+    ".git/": "Metadados de versionamento preservados integralmente, fora da distribuição."
+  },
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "purpose": "Verificação automatizada de código, GUI e distribuição."
+    },
+    {
+      "path": ".gitignore",
+      "purpose": "Exclusão de bytecode, caches e saídas locais do versionamento."
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "purpose": "Procedimento de contribuição e manutenção."
+    },
+    {
+      "path": "LICENSE",
+      "purpose": "Termos BSD-3-Clause."
+    },
+    {
+      "path": "MANIFEST.in",
+      "purpose": "Conteúdo do pacote de fontes."
+    },
+    {
+      "path": "PUBLIC_FILES.json",
+      "purpose": "Lista explícita de arquivos do produto e finalidade técnica."
+    },
+    {
+      "path": "README.md",
+      "purpose": "Apresentação, instalação e pontos de entrada públicos."
+    },
+    {
+      "path": "SUPPORT.md",
+      "purpose": "Orientações para relatos de problemas e suporte."
+    },
+    {
+      "path": "THIRD_PARTY.md",
+      "purpose": "Direitos, atribuições e proveniência dos recursos."
+    },
+    {
+      "path": "docs/METHOD.md",
+      "purpose": "Contratos científicos, fórmulas e limitações."
+    },
+    {
+      "path": "docs/PROJECT_FORMAT.md",
+      "purpose": "Contrato do formato persistido e compatibilidade."
+    },
+    {
+      "path": "docs/REFERENCES.md",
+      "purpose": "Referências dos métodos e bibliotecas documentados."
+    },
+    {
+      "path": "docs/SHARING.md",
+      "purpose": "Instalação, testes e construção das distribuições."
+    },
+    {
+      "path": "docs/USER_GUIDE.md",
+      "purpose": "Manual de utilização e interpretação das saídas."
+    },
+    {
+      "path": "docs/VISUAL_STYLE.md",
+      "purpose": "Contrato dos estilos e separação das cores científicas."
+    },
+    {
+      "path": "notebooks/RIIMA_method_walkthrough.ipynb",
+      "purpose": "Tutorial público executável com entradas sintéticas geradas."
+    },
+    {
+      "path": "pyproject.toml",
+      "purpose": "Metadados e configuração do empacotamento Python."
+    },
+    {
+      "path": "requirements.txt",
+      "purpose": "Dependências de execução."
+    },
+    {
+      "path": "requirements/dev.txt",
+      "purpose": "Dependências da suíte de manutenção."
+    },
+    {
+      "path": "requirements/notebook.txt",
+      "purpose": "Dependências opcionais do notebook público."
+    },
+    {
+      "path": "riima/__init__.py",
+      "purpose": "Versão e identificação do pacote."
+    },
+    {
+      "path": "riima/__main__.py",
+      "purpose": "Entrada do pacote por python -m riima."
+    },
+    {
+      "path": "riima/assets/branding/riima_icon.ico",
+      "purpose": "Ícone da aplicação desktop."
+    },
+    {
+      "path": "riima/assets/branding/riima_logo.png",
+      "purpose": "Logo utilizado pela interface e relatório."
+    },
+    {
+      "path": "riima/core.py",
+      "purpose": "Registro, atributos ópticos, clustering e saídas científicas."
+    },
+    {
+      "path": "riima/data_colors.py",
+      "purpose": "Cores semânticas dos dados e da revisão."
+    },
+    {
+      "path": "riima/exports.py",
+      "purpose": "Transações e gravação íntegra das exportações."
+    },
+    {
+      "path": "riima/gui.py",
+      "purpose": "Interface desktop e coordenação da sessão."
+    },
+    {
+      "path": "riima/metrics.py",
+      "purpose": "Descritores de regiões e estatística axial."
+    },
+    {
+      "path": "riima/report.py",
+      "purpose": "Composição e exportação do relatório HTML."
+    },
+    {
+      "path": "riima/report_charts.py",
+      "purpose": "Renderização Matplotlib das figuras descritivas."
+    },
+    {
+      "path": "riima/report_data.py",
+      "purpose": "Dados descritivos compartilhados pelos renderizadores."
+    },
+    {
+      "path": "riima/report_plot_style.py",
+      "purpose": "Estilos de documentos e figuras sem acoplamento à GUI."
+    },
+    {
+      "path": "riima/report_svg.py",
+      "purpose": "Renderização SVG das figuras descritivas."
+    },
+    {
+      "path": "riima/review.py",
+      "purpose": "Revisão supervisionada e persistência de projetos."
+    },
+    {
+      "path": "riima/templates/descriptive_report.html",
+      "purpose": "Template incorporado ao relatório científico."
+    },
+    {
+      "path": "riima/theme.py",
+      "purpose": "Adaptação do estilo visual aos widgets desktop."
+    },
+    {
+      "path": "riima/viewer.py",
+      "purpose": "Composição de imagens, seleção, zoom e pan."
+    },
+    {
+      "path": "riima/visual_style.py",
+      "purpose": "Tokens compartilhados de interface e documentos."
+    },
+    {
+      "path": "run_gui.bat",
+      "purpose": "Lançador desktop para Windows."
+    },
+    {
+      "path": "scripts/build_share.py",
+      "purpose": "Construção determinística do ZIP pela lista de inclusão."
+    },
+    {
+      "path": "scripts/generate_example.py",
+      "purpose": "Geração de entradas sintéticas sem armazenar fixtures binárias."
+    },
+    {
+      "path": "scripts/run_tests.ps1",
+      "purpose": "Execução dos testes com arquivos temporários externos."
+    },
+    {
+      "path": "scripts/source_identity.py",
+      "purpose": "Identificação de fontes e estado de versionamento."
+    },
+    {
+      "path": "scripts/validate_workflow.py",
+      "purpose": "Integração de persistência, revisão e exportação em processos separados."
+    },
+    {
+      "path": "scripts/verify_distribution.py",
+      "purpose": "Verificação de wheel, sdist e fontes extraídas."
+    },
+    {
+      "path": "scripts/verify_installation.py",
+      "purpose": "Verificação funcional do pacote instalado."
+    },
+    {
+      "path": "tests/test_distribution.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_export_integrity.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_export_transactions.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_project_portability.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_report_backend_fallback.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_report_plot_readability.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_consolidation_degeneracy.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_consolidation_metrics.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_core_optical.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_gui.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_interpretation.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_metrics.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_notebook.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_report.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_report_charts.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_report_svg.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_review.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_riima_viewer.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_source_identity.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_visual_charts.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_visual_desktop.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_visual_figures.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_visual_html.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    },
+    {
+      "path": "tests/test_visual_style.py",
+      "purpose": "Teste automatizado de regressão ou integração do produto."
+    }
+  ]
+}

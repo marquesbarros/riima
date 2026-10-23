@@ -4,7 +4,8 @@
 function's full local namespace right after the real widget tree is built, instead of
 entering ``mainloop``. This drives the actual widgets (real Canvas, real event handler
 closures, real ``session`` state dict) rather than mocking the GUI away, without blocking
-on an event loop or requiring user interaction.
+on an event loop or requiring user interaction. Native desktop control tests reuse
+this interpreter with isolated Toplevel hosts, avoiding repeated Tk initialization.
 """
 import time
 import dataclasses
@@ -49,7 +50,7 @@ def confirm_replacement_by_default(app, monkeypatch):
 def test_two_environments_share_one_group_tree_and_independent_active_group(app, tmp_path):
     from tkinter import ttk
     from test_riima_review import prepared_dataset
-    assert list(app['step_buttons']) == ['preparation', 'interpretation']
+    assert 'step_buttons' not in app and 'stepbar' not in app
     assert isinstance(app['group_tree'], ttk.Treeview)
     prepared = prepared_dataset(tmp_path)
     app['session']['prepared'] = prepared
@@ -64,7 +65,7 @@ def test_two_environments_share_one_group_tree_and_independent_active_group(app,
     assert prepared['review'].selected_cluster == 1
     assert app['review_frame'].winfo_manager() == 'pack'
     assert app['optical_group_frame'].winfo_manager() == 'pack'
-    assert app['sidebar_container'].winfo_width() == 272
+    assert app['sidebar_container'].winfo_width() >= 252
     for button in app['review_tool_buttons'].values():
         assert button.cget('text') and str(button.cget('compound')) == 'image'
     app['go_to_step']('preparation')
@@ -130,9 +131,14 @@ def test_compact_interpretation_controls_fit_with_many_and_long_named_groups(app
         assert scrollbar.winfo_width() >= 10
         assert canvas.winfo_width() + scrollbar.winfo_width() <= container.winfo_width()
         assert scrollbar.winfo_x() + scrollbar.winfo_width() <= container.winfo_width()
+        app['set_section_open']('import', True)
+        app['set_section_open']('configuration', True)
+        app['root'].update()
         canvas.yview_moveto(1)
         app['root'].update()
         approval = app['review_approve_btn']
+        approval.focus_force()
+        app['root'].update()
         assert canvas.winfo_rooty() <= approval.winfo_rooty()
         assert approval.winfo_rooty() + approval.winfo_height() <= canvas.winfo_rooty() + canvas.winfo_height()
         canvas.yview_moveto(0)
@@ -140,7 +146,9 @@ def test_compact_interpretation_controls_fit_with_many_and_long_named_groups(app
         from tkinter import ttk
         app['go_to_step']('preparation')
         app['root'].update()
-        preparation = app['step_frames']['preparation']
+        app['set_section_open']('configuration', True)
+        app['root'].update()
+        preparation = app['section_frames']['configuration']
         descriptions = [child for child in preparation.winfo_children()
                         if isinstance(child, ttk.Label) and int(child.cget('wraplength') or 0) > 0]
         assert len(descriptions) == 2
@@ -229,7 +237,6 @@ def test_replacement_project_failure_keeps_prior_analysis_and_archive(app, tmp_p
     archive = Path(app['session']['project_path'])
     previous_bytes, before = archive.read_bytes(), scientific_state(prepared)
     app['clusters_var'].set(3)
-    app['mask_mode_var'].set('Somente sobreposição comum')
     app['analysis_mode_var'].set('Registradas (mesmo campo)')
     save = review.save_project
     def fail_new(data, path):
@@ -289,7 +296,7 @@ def test_legacy_metadata_does_not_overwrite_catalog_colors_or_select_empty_prove
 
 def test_compact_global_actions_and_four_primary_steps(app, tmp_path):
     from test_riima_review import prepared_dataset
-    assert list(app['step_buttons']) == ['preparation', 'interpretation']
+    assert 'step_buttons' not in app and 'stepbar' not in app
     assert 'export_menu' in app, 'exports must stay accessible above the workspace'
     prepared = prepared_dataset(tmp_path, count=1)
     app['session']['prepared'] = prepared
@@ -303,7 +310,7 @@ def test_compact_global_actions_and_four_primary_steps(app, tmp_path):
     assert str(menu.entrycget(0, 'state')) == 'disabled'
     assert str(menu.entrycget(1, 'state')) == 'normal'
     app['go_to_step']('results')
-    assert app['workflow_var'].get() == 'interpretation'
+    assert app['workflow_var'].get() == 'workbench'
     assert all(button.cget('image') for button in app['review_tool_buttons'].values())
     assert all(button in app['tooltips'] for button in app['review_tool_buttons'].values())
 
@@ -380,38 +387,55 @@ def test_preview_title_does_not_push_zoom_controls_outside_small_window(app):
         root.geometry(previous_geometry)
 
 
-def test_mask_comparison_shows_exact_support_without_export_or_reclassification(app, tmp_path):
+def test_analysis_mask_view_preserves_support_without_export_or_reclassification(app, tmp_path):
     from test_riima_review import prepared_dataset
     from test_export_integrity import file_bytes, scientific_state
-    assert 'open_mask_comparison' in app, 'mask support must be inspectable alongside geometric overlap'
+    assert 'open_mask_comparison' not in app
     prepared = prepared_dataset(tmp_path, count=1)
-    raw = prepared['review'].items[0]['optical']
+    item = prepared['review'].items[0]
+    raw = item['optical']
     raw['valid'] = raw['valid'].copy()
     raw['valid'][0, :4] = False
+    item['valid'] = raw['valid'].copy()
+    item['display_valid'] = raw['valid'].copy()
     app['session']['prepared'] = prepared
     app['setup_review']()
     before, state = file_bytes(tmp_path), scientific_state(prepared)
-    window = app['open_mask_comparison']()
-    texts = ' '.join(_collect_label_texts(window))
-    assert '380 pixels' in texts and '384 pixels' in texts
-    assert 'independente' in texts.lower()
+    app['view_type_var'].set('layers')
+    app['on_view_type_change']()
+    app['review_display_var'].set('Máscara')
+    app['change_preview']()
+    np.testing.assert_array_equal(app['session']['current_rgb'][..., 0], item['valid'].astype(np.uint8) * 255)
+    assert int(raw['valid'].sum()) == 380 and raw['valid'].size == 384
     assert file_bytes(tmp_path) == before and scientific_state(prepared) == state
-    assert int(raw['valid'].sum()) == 380
-    window.destroy()
 
 
-def test_historical_registered_mask_missing_overlap_is_explicitly_unavailable(app, tmp_path):
+def test_historical_registered_mask_without_overlap_renders_saved_domain(app, tmp_path):
     from test_riima_review import prepared_dataset
-    assert 'open_mask_comparison' in app
-    prepared = prepared_dataset(tmp_path, count=1)
-    prepared['review'].mode = 'registered'
+    from test_export_integrity import scientific_state
+    assert 'open_mask_comparison' not in app
+    fixture = prepared_dataset(tmp_path, count=1)
+    prepared = core.prepare_analysis([fixture['review'].items[0]['path']], str(tmp_path / 'registered'),
+        optical_cfg=core.Config(clusters=2, feature_blur_sigma=0), mask_mode='overlap_only', publish_outputs=False)
+    prepared['review'] = review.ClusterReview.from_prepared(prepared)
     prepared['optical'].pop('overlap', None)
-    app['session']['prepared'] = prepared
-    app['setup_review']()
-    window = app['open_mask_comparison']()
-    assert 'indisponível' in ' '.join(_collect_label_texts(window)).lower()
-    assert 'overlap' not in prepared['optical']
-    window.destroy()
+    path = tmp_path / 'historical-mask.riima'
+    review.save_project(prepared, path)
+    loaded = review.load_project(path)
+    before = scientific_state(loaded)
+    for key in ('initial', 'labels', 'locked', 'valid', 'display_valid'):
+        np.testing.assert_array_equal(loaded['review'].items[0][key], prepared['review'].items[0][key])
+    app['show_loaded_project'](loaded, str(path))
+    app['view_type_var'].set('layers')
+    app['on_view_type_change']()
+    app['review_display_var'].set('Máscara')
+    app['change_preview']()
+    assert loaded['optical']['mask_mode'] == 'overlap_only'
+    assert 'overlap' not in prepared['optical'] and 'overlap' not in loaded['optical']
+    assert loaded['review'].mode == 'registered'
+    assert scientific_state(loaded) == before
+    np.testing.assert_array_equal(app['session']['current_rgb'][..., 0],
+                                  prepared['review'].items[0]['valid'].astype(np.uint8) * 255)
 
 
 def test_context_similarity_matches_reference_and_caches_science_only(app, tmp_path, monkeypatch):
@@ -939,8 +963,10 @@ def test_workflow_controls_fit_the_sidebar(app, tmp_path, geometry):
             root.update()
             canvas = app['sidebar_canvas']
             left, right = canvas.winfo_rootx(), canvas.winfo_rootx() + canvas.winfo_width()
-            expected_step = riima_gui._STEP_ALIASES.get(step, step)
-            for child in descendants(app['step_frames'][expected_step]):
+            for name in ('import', 'configuration'):
+                app['set_section_open'](name, True)
+            root.update()
+            for child in descendants(app['sidebar']):
                 if child.winfo_ismapped() and isinstance(child, (
                         ttk.Button, ttk.Checkbutton, ttk.Radiobutton, ttk.Combobox, tk.Listbox)):
                     x = child.winfo_rootx()
@@ -991,7 +1017,7 @@ def test_failed_reclassification_keeps_the_current_review_and_workspace(app, tmp
     assert session['viewport'] is viewport
     assert app['view_type_var'].get() == 'compare'
     assert session['compare_mode']
-    assert app['workflow_var'].get() == 'preparation'
+    assert app['workflow_var'].get() == 'workbench'
     np.testing.assert_array_equal(session['current_rgb'], before)
     np.testing.assert_array_equal(state.items[0]['locked'], approved)
     assert state.has_pending and state.items[0]['annotations'][0].flat[pixel] == 1
@@ -1021,7 +1047,7 @@ def test_results_report_button_exports_html_and_cancellation_does_not_compute(ap
     menu.invoke(0)
     html = target.read_text(encoding='utf-8')
     assert html.index('id="classificacao"') < html.index('id="tamanho"')
-    assert app['workflow_var'].get() == 'interpretation'
+    assert app['workflow_var'].get() == 'workbench'
     assert app['session']['prepared'] is prepared
 
 
@@ -1129,11 +1155,10 @@ def test_complete_registered_workflow_reviews_resumes_and_exports_consistent_res
     app['choose_images']()
     app['go_to_step']('preparation')
     app['clusters_var'].set(4)
-    app['mask_mode_var'].set('Somente sobreposição comum')
     app['analyze_btn'].invoke()
     prepared = app['session']['prepared']
     assert prepared['optical']['sample_X'].shape[1] == 8
-    assert app['workflow_var'].get() == 'preparation'
+    assert app['workflow_var'].get() == 'workbench'
     app['go_to_step']('interpretation')
     groups = app['optical_group_list']
     app['group_tree'].selection_set(())
@@ -1243,16 +1268,16 @@ def test_classification_stays_in_current_stage_for_k_evaluation(app, tmp_path, m
     app['session']['images'] = [dict(path=path, name=Path(path).name) for path in paths]
     app['rebuild_image_rows']()
     app['reference_var'].set(0)
-    app['mask_mode_var'].set('Somente sobreposição comum')
     app['clusters_var'].set(2)
     app['analysis_mode_var'].set('Independentes (campos distintos)' if mode == 'independent' else 'Registradas (mesmo campo)')
     app['out_var'].set(str(tmp_path / 'new-analysis'))
     app['go_to_step']('classify')
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda title, text: pytest.fail(text))
     app['analyze']()
-    assert app['workflow_var'].get() == 'preparation'
-    assert app['step_frames']['preparation'].winfo_manager() == 'pack'
-    assert app['step_frames']['interpretation'].winfo_manager() == ''
+    assert app['workflow_var'].get() == 'workbench'
+    assert app['groups_context'].winfo_manager() == 'pack'
+    assert app['optical_group_frame'].winfo_manager() == 'pack'
+    assert not app['section_open_vars']['configuration'].get()
     prepared = app['session']['prepared']
     assert prepared['optical']['sample_X'].shape[1] == (4 * image_count if mode == 'registered' else 4)
     assert prepared['review'].mode == mode
@@ -1654,8 +1679,8 @@ def test_guided_workspace_isolates_groups_without_separate_family_or_layer_panel
     app['setup_review']()
     app['refresh_group_listboxes']()
     app['go_to_step']('organize')
-    assert app['step_frames']['interpretation'].winfo_manager() == 'pack'
-    assert app['step_frames']['preparation'].winfo_manager() == ''
+    assert app['groups_context'].winfo_manager() == 'pack'
+    assert app['section_frames']['import'].master.winfo_manager() == 'pack'
     assert app['family_group_frame'].winfo_manager() == ''
     assert app['layers_panel'].winfo_manager() == ''
     app['group_tree'].selection_set(())
@@ -1669,10 +1694,10 @@ def test_guided_workspace_isolates_groups_without_separate_family_or_layer_panel
     assert prepared['review'].groups == {0: {0, 1}, 2: {2}}
     app['go_to_step']('refine')
     assert prepared['review'].selected_cluster == 0
-    assert set(app['session']['_compare_sources']) == {'Imagem original', 'Classificação atual', 'Máscara selecionada'}
+    assert set(app['session']['_compare_sources']) == {'Imagem original', 'Classificação atual', 'Máscara selecionada', 'Máscara'}
     app['go_to_step']('results')
-    assert app['step_frames']['interpretation'].winfo_manager() == 'pack'
-    assert app['step_frames']['preparation'].winfo_manager() == ''
+    assert app['groups_context'].winfo_manager() == 'pack'
+    assert app['section_frames']['import'].master.winfo_manager() == 'pack'
 
 
 def test_workspace_resume_restores_step_image_and_mask_selection(app, tmp_path, monkeypatch):
@@ -1699,7 +1724,7 @@ def test_workspace_resume_restores_step_image_and_mask_selection(app, tmp_path, 
     app['workflow_var'].set('preparation')
     app['review_display_var'].set('Imagem')
     app['open_project']()
-    assert app['workflow_var'].get() == 'interpretation'
+    assert app['workflow_var'].get() == 'workbench'
     assert app['review_display_var'].get() == 'Máscara selecionada'
     assert app['session']['prepared']['review'].selected_image == 1
     assert app['session']['workspace_selected_groups'] == [1]
@@ -1739,8 +1764,8 @@ def test_stage_navigation_preserves_pending_edits_without_training(app, tmp_path
     for step in ('organize', 'refine', 'results', 'organize'):
         app['go_to_step'](step)
         assert state.dirty == {0}
-        expected = riima_gui._STEP_ALIASES.get(step, step)
-        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [expected]
+        assert app['groups_context'].winfo_manager() == 'pack'
+        assert app['review_frame'].winfo_manager() == 'pack'
     for item, initial in zip(state.items, before):
         np.testing.assert_array_equal(item['labels'], initial)
 
@@ -1857,7 +1882,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
     monkeypatch.setattr(app['filedialog'], 'askopenfilename', lambda **kw: str(candidate_path))
     messages = []
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: messages.append(args))
-    controls = ('out_var', 'automatic_output_var', 'reference_var', 'clusters_var', 'mask_mode_var',
+    controls = ('out_var', 'automatic_output_var', 'reference_var', 'clusters_var', 'context_visible_var',
                 'workflow_var', 'review_tool_var', 'review_display_var', 'review_opacity_var',
                 'review_image_var', 'review_cluster_var', 'view_type_var', 'split_left_var',
                 'split_right_var', 'isolate_var', 'contours_var', 'show_applied_var',
@@ -1872,7 +1897,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
     before_cache = session['compare_cache']
     before_active = [v.get() for v in session['_active_vars']]
     before_selection = _group_row_indices(app)
-    before_frames = {key: frame.winfo_manager() for key, frame in app['step_frames'].items()}
+    before_frames = {key: frame.winfo_manager() for key, frame in app['section_frames'].items()}
     def legend_text(widget):
         return [(child.cget('text') if 'text' in child.keys() else '', legend_text(child))
                 for child in widget.winfo_children()]
@@ -1900,7 +1925,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
         assert {key: app[key].get() for key in controls} == before_controls
         assert [v.get() for v in session['_active_vars']] == before_active
         assert _group_row_indices(app) == before_selection
-        assert {key: frame.winfo_manager() for key, frame in app['step_frames'].items()} == before_frames
+        assert {key: frame.winfo_manager() for key, frame in app['section_frames'].items()} == before_frames
         assert legend_text(app['legend_rows']) == before_legend
         assert canvas_contents() == before_canvas
         for item, arrays in zip(previous['review'].items, before_arrays):
@@ -1948,7 +1973,7 @@ def test_failed_first_project_open_preserves_unanalyzed_images(app, tmp_path, mo
     assert session['images'] == before_images
     assert [v.get() for v in session['_active_vars']] == [False]
     assert session['current_rgb'] is None
-    assert app['workflow_var'].get() == 'preparation'
+    assert app['workflow_var'].get() == 'workbench'
     assert app['status_var'].get() == before_status
     assert [(canvas.type(i), canvas.coords(i), canvas.itemconfigure(i)) for i in canvas.find_all()] == before_canvas
 
@@ -1977,7 +2002,7 @@ def test_historical_project_open_restores_valid_workspace_without_changing_scien
     assert app['session']['project_path'] == str(path)
     assert app['session']['workspace_selected_groups'] == [1]
     assert app['session']['split_fraction'] == .25
-    assert app['workflow_var'].get() == 'interpretation'
+    assert app['workflow_var'].get() == 'workbench'
     assert app['view_type_var'].get() == 'compare'
     assert app['review_opacity_var'].get() == 27.
     assert loaded['interpretation'].to_dict() == prepared['interpretation'].to_dict()
@@ -2012,23 +2037,34 @@ def test_open_active_project_keeps_unsaved_review_changes(app, tmp_path, monkeyp
 
 @pytest.fixture(scope="module")
 def app():
-    """One real widget tree shared by every test in this module.
+    """One Tk interpreter for GUI and native desktop control tests.
 
-    Building a fresh ``tk.Tk()`` per test is flaky on this platform: destroying one root
-    and immediately creating another in the same process intermittently raises
-    ``TclError: invalid command name "tcl_findLibrary"`` (a known CPython/Tcl teardown
-    issue), even though each individual root works fine in isolation. Sharing one root and
-    letting each test set only the ``session`` keys it needs avoids that entirely.
+    Reinitializing Tk after destroying a root can fail on Windows/CPython 3.13,
+    even when either group of tests passes in isolation. Keep the workbench
+    root alive for the module; desktop controls use disposable Toplevel hosts.
+    Record real image element arguments during construction for state tests,
+    always calling the original ttk implementation.
     """
+    from tkinter import ttk
     captured = {}
+    image_elements = {}
+    create_element = ttk.Style.element_create
+
+    def record_element(style, name, kind, *args, **options):
+        if kind == 'image':
+            image_elements[name] = args
+        return create_element(style, name, kind, *args, **options)
 
     def hook(ns):
         captured.update(ns)
 
-    riima_gui.gui(_test_hook=hook)
-    captured["root"].update()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ttk.Style, 'element_create', record_element)
+        riima_gui.gui(_test_hook=hook)
+    captured['style']._image_elements = image_elements
+    captured['root'].update()
     yield captured
-    captured["root"].destroy()
+    captured['root'].destroy()
 
 
 @pytest.fixture(scope="module")
@@ -2175,7 +2211,7 @@ def test_legend_comparator_names_original_and_current_classification(analyzed_ap
     app = analyzed_app
     app['view_type_var'].set('compare')
     app['on_view_type_change']()
-    assert set(app['session']['_compare_sources']) == {'Imagem original', 'Classificação atual', 'Máscara selecionada'}
+    assert set(app['session']['_compare_sources']) == {'Imagem original', 'Classificação atual', 'Máscara selecionada', 'Máscara'}
     app['split_left_var'].set('Imagem original')
     app['split_right_var'].set('Classificação atual')
     app['on_compare_source_change']()
@@ -2342,12 +2378,12 @@ def test_sidebar_shows_only_active_step_and_preserves_viewport(analyzed_app):
     viewport = dataclasses.asdict(app['session']['viewport'])
     for step in ('classify', 'organize', 'refine', 'results'):
         app['go_to_step'](step)
-        expected = riima_gui._STEP_ALIASES.get(step, step)
-        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [expected]
+        assert app['groups_context'].winfo_manager() == 'pack'
+        assert app['review_frame'].winfo_manager() == 'pack'
         assert dataclasses.asdict(app['session']['viewport']) == viewport
-    assert app['diagnostics_slot'].master is app['step_frames']['preparation']
-    assert app['optical_group_frame'].master is app['step_frames']['interpretation']
-    assert app['review_frame'].master is app['step_frames']['interpretation']
+    assert app['diagnostics_slot'].master is app['section_frames']['configuration']
+    assert app['optical_group_frame'].master is app['groups_context']
+    assert app['review_frame'].master is app['groups_context']
 
 def test_diagnostics_block_is_compact_not_a_tall_bordered_section(app):
     """The diagnostics entry fits within the classification sidebar."""
@@ -2356,7 +2392,7 @@ def test_diagnostics_block_is_compact_not_a_tall_bordered_section(app):
     assert not isinstance(diagnostics_frame, ttk.Labelframe)
     children = diagnostics_frame.winfo_children()
     buttons = [w for w in children if isinstance(w, ttk.Button)]
-    assert [button.cget('text') for button in buttons] == ['Diagnóstico de K...', 'Conferir máscara']
+    assert [button.cget('text') for button in buttons] == ['Diagnóstico de K...']
 
 
 def test_cluster_count_spinbox_and_diagnostic_share_the_same_k_range(app):
@@ -2401,7 +2437,7 @@ def test_manual_cluster_family_actions_preserve_raw_and_refresh_comparator(analy
     app["merge_optical_selected"]()
     assert {0, 2} in interpretation.groups
     assert np.array_equal(prepared["optical"]["labels"], raw)
-    assert set(app["session"]["_compare_sources"]) == {"Imagem original", "Classificação atual", "Máscara selecionada"}
+    assert set(app["session"]["_compare_sources"]) == {"Imagem original", "Classificação atual", "Máscara selecionada", "Máscara"}
     app["apply_interpretation"]("reset")
     assert interpretation.groups == [{i} for i in range(prepared["optical"]["clusters"])]
     assert interpretation.families == []
@@ -2839,6 +2875,7 @@ def test_long_legend_label_wraps_inside_scrollable_viewport(app, geometry, label
         if label_padding is not None:
             style.configure('TLabel', padding=label_padding)
         root.geometry(geometry)
+        app['set_section_open']('legend', True)
         app['clear_legend']()
         app['_draw_legend_rows']('test', [dict(label=long_label, detail='Detalhes completos ' * 12, color=(120, 80, 220))])
         root.update()
@@ -2854,5 +2891,661 @@ def test_long_legend_label_wraps_inside_scrollable_viewport(app, geometry, label
     finally:
         style.configure('TLabel', padding=before_padding or '')
         root.geometry(before)
+        app['set_section_open']('legend', False)
         app['draw_legend']()
 
+
+
+@pytest.mark.parametrize('mode', ['fit', 'manual'])
+def test_single_workbench_focus_and_resize_preserve_all_scientific_interaction(app, tmp_path, mode):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    assert 'context_paned' in app
+    assert 'stepbar' not in app and 'step_buttons' not in app
+    assert not any(isinstance(widget, __import__('tkinter').ttk.Notebook)
+                   for widget in app['root'].winfo_children())
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['change_preview']()
+    app['select_groups']([0, 1])
+    app['review_tool_var'].set('negative')
+    state = prepared['review']
+    state.annotate(0, state.selected_cluster, [212], 1)
+    viewport = viewer.ViewportState(2.25, 9.5, 8.5, mode)
+    app['session']['viewport'] = viewport
+    before = dataclasses.asdict(viewport)
+    science = scientific_state(prepared)
+    canvas, tree = app['preview_canvas'], app['group_tree']
+    app['root'].update()
+    width = canvas.winfo_width()
+    app['context_paned'].sash_place(0, 320, 0)
+    app['root'].update()
+    panel_width = app['sidebar_container'].winfo_width()
+    app['toggle_context_panel']()
+    app['root'].update()
+    assert not app['sidebar_container'].winfo_ismapped()
+    assert 'Restaurar painel' in app['tooltips'][app['focus_panel_btn']]['text']()
+    assert canvas.winfo_width() > width
+    app['toggle_context_panel']()
+    app['root'].update()
+    app['render_preview_canvas']()
+    assert app['sidebar_container'].winfo_width() == panel_width
+    assert 'Recolher painel' in app['tooltips'][app['focus_panel_btn']]['text']()
+    assert app['preview_canvas'] is canvas and app['group_tree'] is tree
+    assert app['session']['viewport'] is viewport
+    assert dataclasses.asdict(viewport) == before
+    assert app['selected_workspace_groups']() == [0, 1]
+    assert app['review_tool_var'].get() == 'negative'
+    assert scientific_state(prepared) == science
+    assert app['optical_group_frame'].winfo_manager() == 'pack'
+    assert app['review_frame'].winfo_manager() == 'pack'
+    app['context_paned'].sash_place(0, 288, 0)
+
+
+def test_workbench_sections_are_independent_and_keep_the_canvas(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    assert set(app['section_frames']) == {'import', 'configuration', 'legend'}
+    assert 'mask_combo' not in app and 'mask_mode_var' not in app
+    assert 'open_mask_comparison' not in app
+    prepared = prepared_dataset(tmp_path)
+    app['show_loaded_project'](prepared, str(tmp_path / 'p.riima'))
+    canvas = app['preview_canvas']
+    assert not app['section_open_vars']['import'].get()
+    assert not app['section_open_vars']['configuration'].get()
+    for name in ('import', 'configuration', 'legend'):
+        app['set_section_open'](name, True)
+        app['root'].update()
+        assert app['section_frames'][name].winfo_manager() == 'pack'
+        assert app['preview_canvas'] is canvas
+        assert app['optical_group_frame'].winfo_manager() == 'pack'
+        assert app['review_frame'].winfo_manager() == 'pack'
+        app['set_section_open'](name, False)
+    assert 'Máscara' in app['review_display_combo']['values']
+
+
+@pytest.mark.parametrize('mode', ['registered', 'independent'])
+def test_new_workbench_analysis_always_uses_auto_mask(app, tmp_path, monkeypatch, mode):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    paths = [prepared['review'].items[0]['path']]
+    app['session']['prepared'] = None
+    app['session']['images'] = [dict(path=path, name=Path(path).name) for path in paths]
+    app['rebuild_image_rows']()
+    app['out_var'].set(str(tmp_path / 'new-auto'))
+    app['analysis_mode_var'].set('Independentes (campos distintos)' if mode == 'independent'
+                                 else 'Registradas (mesmo campo)')
+    captured = []
+    def stop_after_mask(*args, **kwargs):
+        captured.append(kwargs['mask_mode'])
+        raise ValueError('Expected stop after checking mask contract')
+    monkeypatch.setattr(core if mode == 'registered' else review,
+                        'prepare_analysis' if mode == 'registered' else 'prepare_independent_analysis',
+                        stop_after_mask)
+    messages = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: messages.append(args))
+    app['analyze']()
+    assert captured == ['auto']
+    assert len(messages) == 1
+
+
+@pytest.mark.parametrize('mode', ['layers', 'compare'])
+@pytest.mark.parametrize('scaling', [1.0, 1.75, 2.0])
+def test_resizing_context_panel_keeps_view_controls_inside_canvas_workspace(app, tmp_path, mode, scaling):
+    from test_riima_review import prepared_dataset
+    app['show_loaded_project'](prepared_dataset(tmp_path), str(tmp_path / 'view.riima'))
+    root = app['root']
+    previous = root.geometry()
+    previous_scaling = float(root.tk.call('tk', 'scaling'))
+    from riima import theme
+    try:
+        root.tk.call('tk', 'scaling', scaling)
+        theme.apply(root, app['style'])
+        root.geometry('1080x700')
+        app['view_type_var'].set(mode)
+        app['on_view_type_change']()
+        root.update()
+        viewport = app['session']['viewport']
+        viewport_values = dataclasses.asdict(viewport)
+        canvas = app['preview_canvas']
+        app['context_paned'].sash_place(0, 850, 0)
+        root.update()
+        workspace = app['workspace']
+        frame = app['compare_panel'] if mode == 'compare' else app['display_controls']
+        left = workspace.winfo_rootx()
+        right = left + workspace.winfo_width()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        for controls in (frame, app['view_type_row'], app['zoom_toolbar']):
+            for control in descendants(controls):
+                assert control.winfo_ismapped(), (scaling, mode, control)
+                assert control.winfo_width() >= control.winfo_reqwidth(), (scaling, mode, control)
+                assert left <= control.winfo_rootx()
+                assert control.winfo_rootx() + control.winfo_width() <= right
+        if mode == 'compare':
+            comparison_widgets = app['compare_panel'].winfo_children()
+            for label, combo in ((comparison_widgets[0], app['split_left_combo']),
+                                 (comparison_widgets[2], app['split_right_combo'])):
+                assert label.winfo_rootx() + label.winfo_width() <= combo.winfo_rootx()
+                label_center = label.winfo_rooty() + label.winfo_height() / 2
+                combo_center = combo.winfo_rooty() + combo.winfo_height() / 2
+                assert abs(label_center - combo_center) <= 1
+        title = app['preview_title_label']
+        assert title.winfo_ismapped()
+        assert title.winfo_width() >= title.winfo_reqwidth()
+        assert title.winfo_height() >= title.winfo_reqheight()
+        assert left <= title.winfo_rootx()
+        assert title.winfo_rootx() + title.winfo_width() <= right
+        assert title.winfo_rooty() >= workspace.winfo_rooty()
+        assert title.winfo_rooty() + title.winfo_height() <= workspace.winfo_rooty() + workspace.winfo_height()
+        assert canvas.winfo_width() >= 450
+        assert app['preview_canvas'] is canvas and app['session']['viewport'] is viewport
+        assert dataclasses.asdict(viewport) == viewport_values
+    finally:
+        app['context_paned'].sash_place(0, 288, 0)
+        root.tk.call('tk', 'scaling', previous_scaling)
+        theme.apply(root, app['style'])
+        root.geometry(previous)
+
+
+def test_group_tree_tooltip_tracks_full_hovered_and_focused_names(app, tmp_path):
+    from types import SimpleNamespace
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    name = 'Mineral com textura e nome interpretativo muito extenso ' * 7
+    state.rename_group(1, name)
+    app['show_loaded_project'](prepared, str(tmp_path / 'names.riima'))
+    tree = app['group_tree']
+    app['sidebar_canvas'].yview_moveto(0)
+    app['root'].update()
+    tree.see('1')
+    bbox = tree.bbox('1')
+    app['on_group_hover'](SimpleNamespace(y=bbox[1] + bbox[3] // 2))
+    assert name in app['tooltips'][tree]['text']()
+    app['session']['hover_group'] = None
+    tree.focus('1')
+    assert name in app['tooltips'][tree]['text']()
+    app['tooltips'][tree]['hide']()
+
+
+
+@pytest.mark.parametrize('scaling', [1.75, 2.0])
+@pytest.mark.parametrize('analyzed', [False, True])
+def test_minimum_context_width_wraps_explanatory_labels_inside_the_panel(app, tmp_path, scaling, analyzed):
+    from tkinter import ttk
+    from riima import theme
+    from test_riima_review import prepared_dataset
+    root = app['root']
+    previous_scaling = float(root.tk.call('tk', 'scaling'))
+    previous_geometry = root.geometry()
+    if analyzed:
+        app['show_loaded_project'](prepared_dataset(tmp_path), str(tmp_path / 'min.riima'))
+    else:
+        app['session']['prepared'] = None
+        app['change_preview']()
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+    try:
+        root.tk.call('tk', 'scaling', scaling)
+        theme.apply(root, app['style'])
+        root.geometry('1080x700')
+        app['set_section_open']('import', True)
+        app['set_section_open']('configuration', True)
+        app['context_paned'].sash_place(0, 252, 0)
+        root.update()
+        hint = next(widget for widget in app['sidebar'].winfo_children()
+                    if isinstance(widget, ttk.Label)
+                    and str(widget.cget('textvariable')) == str(app['workflow_hint_var']))
+        assert hint.winfo_ismapped()
+        padding = tuple(root.winfo_pixels(str(value)) for value in app['sidebar'].cget('padding'))
+        usable_width = app['sidebar'].winfo_width() - padding[0] - padding[2]
+        assert hint.winfo_reqwidth() <= usable_width
+        assert hint.winfo_width() <= usable_width
+        assert hint.winfo_height() >= hint.winfo_reqheight()
+        assert ('Importe imagens' if not analyzed else 'Selecione para inspecionar') in app['workflow_hint_var'].get()
+        labels = [widget for widget in descendants(app['sidebar'])
+                  if isinstance(widget, ttk.Label) and int(widget.cget('wraplength') or 0) > 0]
+        assert labels
+        for label in labels:
+            if label.winfo_ismapped():
+                assert label.winfo_reqwidth() <= label.master.winfo_width(), label.cget('text')
+    finally:
+        root.tk.call('tk', 'scaling', previous_scaling)
+        theme.apply(root, app['style'])
+        app['context_paned'].sash_place(0, 288, 0)
+        app['set_section_open']('import', False)
+        app['set_section_open']('configuration', False)
+        root.geometry(previous_geometry)
+
+
+@pytest.mark.parametrize('case', ['empty', 'single', 'multiple', 'pending', 'approved', 'background'])
+def test_selection_actions_follow_inspection_selection_and_group_protection(app, tmp_path, case):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    app['show_loaded_project'](prepared, str(tmp_path / 'actions.riima'))
+    state = prepared['review']
+    if case == 'pending':
+        state.annotate(0, 0, [212], 1)
+    elif case == 'approved':
+        state.approve(0)
+    elif case == 'background':
+        state.set_background([0], True)
+    chosen = [] if case == 'empty' else [0, 1] if case == 'multiple' else [0]
+    before = scientific_state(prepared)
+    app['select_groups'](chosen)
+    app['refresh_review_controls']()
+    background = {button.cget('text'): button for button in app['background_actions'].winfo_children()}
+    send = background['Enviar seleção ao fundo']
+    restore = background['Restaurar seleção do fundo']
+    assert app['clear_selection_btn'].instate(['disabled']) == (case == 'empty')
+    assert app['activate_group_btn'].instate(['disabled']) == (case == 'empty')
+    assert app['similarity_btn'].instate(['disabled']) == (case in ('empty', 'pending', 'background'))
+    assert send.instate(['disabled']) == (case in ('empty', 'approved', 'background'))
+    assert restore.instate(['disabled']) == (case != 'background')
+    assert state.selected_cluster == 0
+    assert scientific_state(prepared) == before
+    if case == 'empty':
+        assert app['review_tool_buttons']['positive'].instate(['!disabled'])
+        assert app['review_tool_buttons']['negative'].instate(['!disabled'])
+
+
+def test_selection_action_buttons_remain_disabled_during_processing(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    app['show_loaded_project'](prepared_dataset(tmp_path), str(tmp_path / 'busy-actions.riima'))
+    app['select_groups']([0, 1])
+    before = scientific_state(app['session']['prepared'])
+    observed = []
+    def inspect():
+        buttons = app['selection_actions'].winfo_children()
+        observed.append(all(button.instate(['disabled']) for button in buttons))
+        app['clear_group_selection']()
+        app['selected_groups_background'](True)
+        app['select_groups']([])
+    app['root'].after(10, inspect)
+    app['run_operation']('Processando', lambda: time.sleep(.05))
+    assert observed == [True]
+    assert app['selected_workspace_groups']() == [0, 1]
+    assert scientific_state(app['session']['prepared']) == before
+    assert app['clear_selection_btn'].instate(['!disabled'])
+
+
+@pytest.mark.parametrize('embedded', [False, True])
+def test_image_rows_expose_full_name_source_and_updated_status_to_keyboard_tooltips(app, tmp_path, embedded):
+    from tkinter import ttk
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    app['show_loaded_project'](prepared, str(tmp_path / 'sources.riima'))
+    name = 'campo_sintetico_com_nome_extenso_para_inspecao.png'
+    relative = str(Path('imagens de referência') / name)
+    other_name = 'outra_micrografia_com_nome_e_origem_distintos.png'
+    other_relative = str(Path('outra pasta de imagens') / other_name)
+    prepared['review'].items[1]['name'] = other_name
+    prepared['review'].items[1]['path'] = other_relative
+    prepared['optical']['image_names'].append(other_name)
+    prepared['review'].items[0]['name'] = name
+    prepared['review'].items[0]['path'] = relative
+    prepared['optical']['image_names'][0] = name
+    app['session']['images'] = [] if embedded else [dict(name=name, path=relative),
+                                                     dict(name=other_name, path=other_relative)]
+    before = scientific_state(prepared)
+    app['rebuild_image_rows']()
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+    label = next(widget for widget in descendants(app['images_list_frame'])
+                 if isinstance(widget, ttk.Label) and widget.cget('text') == name)
+    assert label in app['tooltips']
+    text = app['tooltips'][label]['text']
+    assert name in (text() if callable(text) else text)
+    assert str(Path(relative).resolve()) in (text() if callable(text) else text)
+    assert str(label.cget('takefocus')) == '1'
+    other = next(widget for widget in descendants(app['images_list_frame'])
+                 if isinstance(widget, ttk.Label) and widget.cget('text') == other_name)
+    other_text = app['tooltips'][other]['text']
+    other_text = other_text() if callable(other_text) else other_text
+    assert other_name in other_text and str(Path(other_relative).resolve()) in other_text
+    assert str(Path(relative).resolve()) not in other_text
+    app['set_section_open']('import', True)
+    label.focus_force()
+    app['root'].update()
+    assert app['tooltips'][label]['popup'] is not None
+    app['tooltips'][label]['hide']()
+    if not embedded:
+        app['update_row_statuses']({name: 'Confira o alinhamento: coordenadas preservadas; registro não verificado.'})
+        app['update_row_statuses']({name: 'Registro de referência preservado.', other_name: 'Outro alinhamento a conferir.'})
+        other_status = app['session']['_status_labels'][other_name]
+        other_tip = app['tooltips'][other_status]['text']()
+        assert other_status.cget('text') in other_tip and str(Path(other_relative).resolve()) in other_tip
+        assert str(Path(relative).resolve()) not in other_tip
+        status = app['session']['_status_labels'][name]
+        assert status in app['tooltips']
+        text = app['tooltips'][status]['text']
+        text = text() if callable(text) else text
+        assert status.cget('text') in text and str(Path(relative).resolve()) in text
+    assert scientific_state(prepared) == before
+    app['set_section_open']('import', False)
+
+
+@pytest.mark.parametrize('panel_width', [288, 360])
+def test_review_tool_buttons_keep_consistent_compact_width_when_panel_resizes(app, tmp_path, panel_width):
+    from test_riima_review import prepared_dataset
+    app['show_loaded_project'](prepared_dataset(tmp_path), str(tmp_path / 'compact.riima'))
+    app['context_paned'].sash_place(0, panel_width, 0)
+    app['root'].update()
+    try:
+        buttons = list(app['review_tool_buttons'].values())
+        assert all(button.winfo_ismapped() for button in buttons)
+        widths = [button.winfo_width() for button in buttons]
+        assert max(widths) - min(widths) <= 1
+        assert all(button.winfo_width() <= button.winfo_reqwidth() + 1 for button in buttons)
+    finally:
+        app['context_paned'].sash_place(0, 288, 0)
+
+
+@pytest.mark.parametrize('operation', ['create', 'rename', 'delete', 'undo'])
+def test_catalog_operations_finish_with_unsaved_status_and_preserve_expected_arrays(app, tmp_path, operation):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    if operation == 'delete':
+        empty = state.create_group('Grupo vazio')
+    app['show_loaded_project'](prepared, str(tmp_path / 'catalog.riima'))
+    original = [{key: item[key].copy() for key in ('initial', 'labels', 'locked', 'valid')}
+                for item in state.items]
+    initial_ids = set(state.groups)
+    app['status_var'].set('Atualizando os grupos...')
+    if operation == 'create':
+        created = app['group_edit']('create_group', 'Novo grupo')
+        assert set(state.groups) == initial_ids | {created} and not state.groups[created]
+    elif operation == 'rename':
+        app['group_edit']('rename_group', 0, 'Matriz atual', presentation=True)
+        assert state.group_name(0) == 'Matriz atual'
+    elif operation == 'delete':
+        app['group_edit']('delete_group', empty)
+        assert set(state.groups) == initial_ids - {empty}
+    else:
+        created = app['group_edit']('create_group', 'Temporário')
+        app['status_var'].set('Atualizando os grupos...')
+        app['undo_group_current']()
+        assert set(state.groups) == initial_ids and created not in state.groups
+    assert not app['session']['busy'] and app['session']['project_dirty']
+    assert 'não salvas' in app['status_var'].get()
+    assert not app['status_var'].get().endswith('...')
+    for item, expected in zip(state.items, original):
+        for key, value in expected.items():
+            np.testing.assert_array_equal(item[key], value)
+
+
+def test_catalog_failure_keeps_error_status_and_scientific_state(app, tmp_path, monkeypatch):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    prepared['review'].approve(0)
+    app['show_loaded_project'](prepared, str(tmp_path / 'protected.riima'))
+    before = scientific_state(prepared)
+    errors = []
+    monkeypatch.setattr(app['messagebox'], 'showinfo', lambda *args: errors.append(args))
+    app['group_edit']('delete_group', 0)
+    assert errors and not app['session']['busy']
+    assert scientific_state(prepared) == before
+    assert not app['session']['project_dirty']
+    assert 'Não foi possível' in app['status_var'].get()
+
+
+@pytest.mark.parametrize('scaling', [1.75, 2.0])
+def test_output_folder_controls_fit_minimum_panel_at_large_scaling_and_keep_behavior(app, tmp_path, monkeypatch, scaling):
+    from tkinter import ttk
+    from riima import theme
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['show_loaded_project'](prepared, str(tmp_path / 'output.riima'))
+    root = app['root']
+    previous_scaling = float(root.tk.call('tk', 'scaling'))
+    previous_geometry = root.geometry()
+    original = [{key: item[key].copy() for key in ('initial', 'labels', 'locked', 'valid')}
+                for item in prepared['review'].items]
+    try:
+        root.tk.call('tk', 'scaling', scaling)
+        theme.apply(root, app['style'])
+        root.geometry('1080x700')
+        app['set_section_open']('import', True)
+        app['context_paned'].sash_place(0, 252, 0)
+        root.update()
+        button = next(widget for widget in app['outrow'].winfo_children() if isinstance(widget, ttk.Button))
+        entry = next(widget for widget in app['outrow'].winfo_children() if isinstance(widget, ttk.Entry))
+        check = next(widget for widget in app['images_step'].winfo_children() if isinstance(widget, ttk.Checkbutton))
+        assert button.winfo_ismapped() and button.winfo_width() >= button.winfo_reqwidth()
+        assert entry.winfo_ismapped() and entry.winfo_width() >= 20
+        assert button.winfo_x() + button.winfo_width() <= app['outrow'].winfo_width()
+        assert check.cget('text') == 'Pasta automática'
+        assert check.winfo_reqwidth() <= check.master.winfo_width()
+        assert button in app['tooltips'] and check in app['tooltips']
+        assert 'novas imagens' in app['tooltips'][check]['text']
+        app['automatic_output_var'].set(True)
+        check.invoke()
+        assert app['automatic_output_var'].get() is False
+        check.invoke()
+        assert app['automatic_output_var'].get() is True
+        selected = str(tmp_path / 'destino escolhido')
+        monkeypatch.setattr(app['filedialog'], 'askdirectory', lambda **kwargs: selected)
+        button.invoke()
+        assert app['out_var'].get() == selected and prepared['output'] == selected
+        assert prepared['output_pending'] is False
+        assert app['automatic_output_var'].get() is False
+        monkeypatch.setattr(app['filedialog'], 'askdirectory', lambda **kwargs: '')
+        button.invoke()
+        assert app['out_var'].get() == selected and prepared['output'] == selected
+        assert app['automatic_output_var'].get() is False
+        for item, expected in zip(prepared['review'].items, original):
+            for key, value in expected.items():
+                np.testing.assert_array_equal(item[key], value)
+    finally:
+        root.tk.call('tk', 'scaling', previous_scaling)
+        theme.apply(root, app['style'])
+        app['context_paned'].sash_place(0, 288, 0)
+        app['set_section_open']('import', False)
+        root.geometry(previous_geometry)
+
+
+@pytest.fixture
+def desktop_style(app):
+    """Isolate each control case in a Toplevel on the existing GUI interpreter."""
+    host = tk.Toplevel(app['root'])
+    host.withdraw()
+    host.geometry('480x300+30+30')
+    assert host.tk is app['root'].tk
+    try:
+        yield host, app['style']
+    finally:
+        host.destroy()
+        app['root'].update_idletasks()
+
+
+@pytest.mark.parametrize('name', [
+    'TButton', 'Icon.TButton', 'Selected.TButton', 'Primary.TButton',
+    'Toolbar.TMenubutton', 'TEntry', 'TCombobox', 'TSpinbox',
+    'TCheckbutton', 'TRadiobutton', 'Treeview', 'Treeview.Heading',
+    'Horizontal.TScale', 'Vertical.TScrollbar', 'TLabelframe',
+])
+def test_desktop_layouts_replace_platform_frames_and_indicators(desktop_style, name):
+    _root, style = desktop_style
+    def elements(layout):
+        for element, options in layout:
+            yield element
+            yield from elements(options.get('children', []))
+    names = list(elements(style.layout(name)))
+    assert any(element.startswith('RIIMA.') for element in names), (name, names)
+    assert not any(element.endswith(('.border', '.focus')) for element in names), (name, names)
+    assert str(style.lookup(name, 'relief', default='flat')) == 'flat'
+
+
+def test_flat_controls_preserve_pointer_keyboard_and_popup_behavior(desktop_style):
+    from test_visual_desktop import _contrast
+    import tkinter as tk
+    from tkinter import ttk
+    root, style = desktop_style
+    root.geometry('480x300+30+30')
+    selected = tk.BooleanVar(root, False)
+    check = ttk.Checkbutton(root, text='Opção', variable=selected)
+    check.pack()
+    value = tk.StringVar(root, '3')
+    spin = ttk.Spinbox(root, from_=1, to=9, textvariable=value)
+    spin.pack()
+    combo = ttk.Combobox(root, values=('Primeiro', 'Segundo'), state='readonly')
+    combo.current(0)
+    combo.pack()
+    entry = ttk.Entry(root)
+    entry.pack()
+    root.deiconify()
+    root.update()
+    check.focus_force()
+    check.event_generate('<space>')
+    root.update()
+    assert selected.get()
+    check.state(['disabled'])
+    check.event_generate('<space>')
+    assert selected.get()
+    spin.focus_force()
+    spin.event_generate('<Up>')
+    root.update()
+    assert value.get() == '4'
+    points = [(x, y) for x in range(spin.winfo_width() - 24, spin.winfo_width())
+              for y in range(spin.winfo_height()) if spin.identify(x, y).endswith('uparrow')]
+    assert points, 'Spinbox increment must remain a pointer target'
+    x, y = points[len(points) // 2]
+    spin.event_generate('<ButtonPress-1>', x=x, y=y)
+    spin.event_generate('<ButtonRelease-1>', x=x, y=y)
+    root.update()
+    assert value.get() == '5'
+    combo.focus_force()
+    combo.event_generate('<Down>')
+    root.update()
+    popup = root.tk.call('ttk::combobox::PopdownWindow', str(combo))
+    assert root.tk.getboolean(root.tk.call('winfo', 'ismapped', popup))
+    root.tk.call('ttk::combobox::Unpost', str(combo))
+    entry.focus_force()
+    root.update()
+    assert root.focus_get() is entry
+    entry.insert(0, 'Texto editável')
+    assert entry.get() == 'Texto editável'
+    assert _contrast(style.lookup('TEntry', 'foreground'),
+                     style.lookup('TEntry', 'fieldbackground')) >= 4.5
+
+
+def test_flat_theme_reapplication_keeps_live_elements_and_compact_targets(desktop_style):
+    from riima import theme
+    from tkinter import ttk
+    root, style = desktop_style
+    button = ttk.Button(root, text='Ação', style='Icon.TButton', image='')
+    button.pack()
+    root.update_idletasks()
+    original = (button.winfo_reqwidth(), button.winfo_reqheight())
+    image_names = set(root.tk.call('image', 'names'))
+    theme.apply(root._root(), style)
+    root.update_idletasks()
+    assert set(root.tk.call('image', 'names')) == image_names
+    assert (button.winfo_reqwidth(), button.winfo_reqheight()) == original
+    assert original[0] >= 28 and original[1] >= 28
+    assert int(style.lookup('TButton', 'width')) == 0
+
+
+def test_editable_controls_share_compact_height(desktop_style):
+    from tkinter import ttk
+    root, _style = desktop_style
+    widgets = [ttk.Entry(root), ttk.Combobox(root), ttk.Spinbox(root, from_=1, to=10)]
+    for widget in widgets:
+        widget.pack()
+    root.update_idletasks()
+    heights = [widget.winfo_reqheight() for widget in widgets]
+    assert max(heights) - min(heights) <= 4, heights
+
+
+def test_flat_scrollbar_preserves_arrow_steps_and_thumb_targets(desktop_style):
+    from tkinter import ttk
+    root, _style = desktop_style
+    frame = ttk.Frame(root)
+    frame.pack(fill='both', expand=True)
+    tree = ttk.Treeview(frame, height=4)
+    tree.pack(side='left', fill='both', expand=True)
+    scroll = ttk.Scrollbar(frame, command=tree.yview)
+    scroll.pack(side='right', fill='y')
+    tree.configure(yscrollcommand=scroll.set)
+    for i in range(100):
+        tree.insert('', 'end', text=str(i))
+    root.deiconify()
+    root.update()
+    before = tree.yview()
+    targets = {}
+    for y in range(scroll.winfo_height()):
+        name = scroll.identify(scroll.winfo_width() // 2, y)
+        for suffix in ('uparrow', 'downarrow', 'thumb'):
+            if name.endswith(suffix):
+                targets[suffix] = y
+    assert set(targets) == {'uparrow', 'downarrow', 'thumb'}
+    x, y = scroll.winfo_width() // 2, targets['downarrow']
+    scroll.event_generate('<ButtonPress-1>', x=x, y=y)
+    scroll.event_generate('<ButtonRelease-1>', x=x, y=y)
+    root.update()
+    assert tree.yview()[0] > before[0]
+    previous = tree.yview()[0]
+    root.update()
+    ys = [y for y in range(scroll.winfo_height())
+          if scroll.identify(x, y).endswith('thumb')]
+    y = ys[len(ys) // 2]
+    scroll.event_generate('<ButtonPress-1>', x=x, y=y)
+    scroll.event_generate('<B1-Motion>', x=x, y=y+20)
+    scroll.event_generate('<ButtonRelease-1>', x=x, y=y+20)
+    root.update()
+    assert tree.yview()[0] > previous
+
+
+def test_flat_scale_keeps_keyboard_and_pointer_drag(desktop_style):
+    from tkinter import ttk
+    root, _style = desktop_style
+    scale = ttk.Scale(root, from_=0, to=100, length=240)
+    scale.pack()
+    root.deiconify()
+    root.update()
+    scale.set(10)
+    scale.focus_force()
+    scale.event_generate('<Right>')
+    root.update()
+    assert scale.get() > 10
+    before = scale.get()
+    y = scale.winfo_height() // 2
+    xs = [x for x in range(scale.winfo_width()) if scale.identify(x, y).endswith('slider')]
+    assert xs
+    x = xs[len(xs) // 2]
+    scale.event_generate('<ButtonPress-1>', x=x, y=y)
+    scale.event_generate('<B1-Motion>', x=x+50, y=y)
+    scale.event_generate('<ButtonRelease-1>', x=x+50, y=y)
+    root.update()
+    assert scale.get() > before
+
+
+@pytest.mark.parametrize('name', ['button', 'primary', 'option'])
+def test_focused_buttons_preserve_hover_press_feedback_and_focus_ring(desktop_style, name):
+    _root, style = desktop_style
+    definition = style._image_elements['RIIMA.' + name]
+    def image_for(*states):
+        for *required, image in definition[1:]:
+            if all(state in states for state in required):
+                return image
+        return definition[0]
+    def pixel(image, x, y):
+        return image.tk.call(str(image), 'get', x, y)
+    focused = image_for('focus')
+    for state in ('active', 'pressed'):
+        interactive = image_for('focus', state)
+        assert pixel(interactive, 12, 12) != pixel(focused, 12, 12)
+        assert pixel(interactive, 12, 0) == pixel(focused, 12, 0)
+    assert image_for('focus', 'pressed', 'disabled') is image_for('disabled')

@@ -22,7 +22,7 @@ A = união das máscaras de anotação de todas as imagens
 V = O AND S AND NOT A
 ```
 
-`specimen_area_mask` usa brilho ou saturação como evidência de espécime e identifica fundo escuro conectado à borda. `red_annotation_mask` exige cor e evidência de forma, como alongamento ou contato com a borda, para reduzir exclusões de regiões vermelhas/rosadas reais. Essas máscaras são heurísticas; o usuário deve inspecioná-las em **Conferir máscara**, na GUI, ou no produto exportado `analysis_mask.png`. O modo `overlap_only` usa somente O, quando as exclusões automáticas não forem apropriadas.
+`specimen_area_mask` usa brilho ou saturação como evidência de espécime e identifica fundo escuro conectado à borda. `red_annotation_mask` exige cor e evidência de forma, como alongamento ou contato com a borda, para reduzir exclusões de regiões vermelhas/rosadas reais. Essas máscaras são heurísticas; a visualização **Máscara**, na GUI, apresenta o domínio válido atual. O produto exportado `analysis_mask.png` registra a máscara inicial. Novas análises da interface usam `auto`; projetos históricos preservam seu domínio salvo. O modo `overlap_only` usa somente O e continua disponível na CLI/API.
 
 Com diagnósticos ativados, os componentes da máscara também podem ser exportados. Nenhuma máscara atribui uma identidade mineral.
 

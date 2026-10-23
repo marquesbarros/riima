@@ -90,7 +90,7 @@ def test_workspace_mask_uses_current_group_union_and_excludes_rejected_pixels(tm
 def test_workspace_sources_remain_fixed_as_groups_are_organized_and_refined(tmp_path):
     from test_riima_review import prepared_dataset
     prepared = prepared_dataset(tmp_path)
-    expected = ['original', 'classification', 'selection_mask']
+    expected = ['original', 'classification', 'selection_mask', 'analysis_mask']
     assert [entry['id'] for entry in viewer.workspace_sources(prepared, [0])] == expected
     prepared['interpretation'].merge_clusters([0, 1])
     prepared['review'].sync_groups(prepared['interpretation'].groups)
@@ -578,3 +578,32 @@ def test_family_map_uses_manual_color_and_leaves_unassigned_neutral():
     rgb = render_preview_mode("Famílias", prepared)
     assert np.all(rgb[:, :4] == 30)
     assert np.all(rgb[:, 4:] == (12, 34, 56))
+
+
+def test_analysis_mask_includes_unassigned_valid_pixels_and_ignores_selection(monkeypatch):
+    base = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+    labels = np.array([[0, -1, 1], [1, -1, 0]])
+    valid = np.array([[True, True, False], [True, False, True]])
+    current = dict(base=base, labels=labels, valid=valid,
+                   palette=np.array([[20, 40, 60], [70, 90, 110]], dtype=np.uint8),
+                   annotations={})
+    monkeypatch.setattr(viewer, 'workspace_data', lambda prepared: current)
+    expected = np.array([[255, 255, 0], [255, 0, 255]], dtype=np.uint8)
+    for selection in (None, [], [0], [1]):
+        rgb = viewer.render_workspace({}, 'Máscara', selected_groups=selection, contours=True)
+        np.testing.assert_array_equal(rgb, np.repeat(expected[..., None], 3, axis=2))
+    partial = viewer.workspace_pixels({}, 'Máscara', indices=np.array([1, 2, 3, 4]))
+    np.testing.assert_array_equal(partial, [[255, 255, 255], [0, 0, 0], [255, 255, 255], [0, 0, 0]])
+    np.testing.assert_array_equal(labels, [[0, -1, 1], [1, -1, 0]])
+    np.testing.assert_array_equal(base, np.arange(18, dtype=np.uint8).reshape(2, 3, 3))
+
+
+def test_comparison_offers_analysis_mask_without_replacing_selection_mask(monkeypatch):
+    current = dict(base=np.zeros((2, 3, 3), np.uint8), labels=np.array([[0, -1, -1], [1, -1, 0]]),
+                   valid=np.array([[True, True, False], [True, False, True]]),
+                   palette=np.array([[20, 40, 60], [70, 90, 110]], np.uint8), annotations={})
+    monkeypatch.setattr(viewer, 'workspace_data', lambda prepared: current)
+    sources = {entry['id']: entry for entry in viewer.workspace_sources({}, [0])}
+    assert sources['analysis_mask']['label'] == 'Máscara'
+    np.testing.assert_array_equal(sources['analysis_mask']['render']()[..., 0], [[255, 255, 0], [255, 0, 255]])
+    np.testing.assert_array_equal(sources['selection_mask']['render']()[..., 0], [[255, 0, 0], [0, 0, 255]])

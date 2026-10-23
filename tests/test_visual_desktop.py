@@ -1,4 +1,7 @@
-"""Pure contrast and scientific raster contracts; real Tk tests share test_riima_gui."""
+"""Pure desktop contrast and scientific raster contracts.
+
+Native ttk interaction tests share the GUI interpreter in test_riima_gui.py.
+"""
 import hashlib
 import json
 
@@ -149,3 +152,19 @@ def test_viewer_scientific_pixels_match_original_snapshot():
     for mode in _PREVIEW_MODES:
         assert _rgb_signature(viewer.render_preview_mode(mode, prepared)) == _EXPECTED_PREVIEW[mode]
         assert _legend_signature(viewer.build_preview_legend(mode, prepared)) == _EXPECTED_LEGENDS[mode]
+
+
+def test_context_panel_icons_convey_distinct_actions_at_compact_size():
+    names = ('panel', 'legend', 'chevron_down', 'chevron_right')
+    images = [theme.icon_image(name, size=16) for name in names]
+    assert all(image.size == (16, 16) and image.mode == 'RGBA' for image in images)
+    assert all(image.getbbox() is not None for image in images)
+    assert len({image.tobytes() for image in images}) == len(names)
+
+
+def test_desktop_control_states_remain_legible_on_neutral_surfaces():
+    assert _contrast(theme.TEXT_PRIMARY, theme.BG_PANEL) >= 4.5
+    assert _contrast(theme.TEXT_SECONDARY, theme.BG_APP) >= 4.5
+    assert _contrast(theme.TEXT_PRIMARY, theme.ACCENT_SOFT) >= 4.5
+    assert _contrast(theme.TEXT_ON_ACCENT, theme.ACCENT_HOVER) >= 4.5
+    assert _contrast(theme.CONTROL_BORDER, theme.BG_PANEL) >= 3

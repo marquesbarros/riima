@@ -10,6 +10,41 @@ from riima import core, review
 from test_riima_review import prepared_dataset, rewrite_project
 
 
+@pytest.mark.parametrize('mode', ['independent', 'registered'])
+@pytest.mark.parametrize('mask_mode', ['auto', 'overlap_only'])
+def test_mask_view_roundtrip_preserves_saved_analysis_and_manual_background(tmp_path, mode, mask_mode):
+    source = prepared_dataset(tmp_path, count=1)
+    paths = [source['review'].items[0]['path']]
+    cfg = core.Config(clusters=2, feature_blur_sigma=0, sample_pixels=300, chunk_pixels=99)
+    if mode == 'independent':
+        prepared = review.prepare_independent_analysis(paths, str(tmp_path / 'mask-out'), cfg,
+                                                      mask_mode=mask_mode)
+    else:
+        prepared = core.prepare_analysis(paths, str(tmp_path / 'mask-out'), optical_cfg=cfg,
+                                         mask_mode=mask_mode, publish_outputs=False)
+        prepared['review'] = review.ClusterReview.from_prepared(prepared)
+    state = prepared['review']
+    state.exclude(0, [0])
+    state.refine_pending()
+    state.exclude(0, [0], False)
+    state.exclude(0, [1])
+    state.refine_pending()
+    prepared['workspace'] = {'step': 'workbench', 'display': 'Máscara', 'selected_groups': [0]}
+    path = tmp_path / 'mask-view.riima'
+    review.save_project(prepared, path)
+
+    loaded = review.load_project(path)
+
+    assert loaded['workspace']['display'] == 'Máscara'
+    assert loaded['workspace']['step'] == 'workbench'
+    assert loaded['review'].mode == mode
+    actual, expected = loaded['review'].items[0], state.items[0]
+    assert actual['optical']['mask_mode'] == mask_mode
+    assert not actual['excluded'].ravel()[0] and actual['excluded'].ravel()[1]
+    for key in ('valid', 'excluded', 'applied_excluded', 'display_valid', 'labels', 'initial'):
+        np.testing.assert_array_equal(actual[key], expected[key])
+
+
 @pytest.mark.parametrize('count,clusters,budget', [(3, 2, 5), (4, 3, 10), (6, 2, 5)])
 def test_independent_impossible_budget_is_rejected_before_read_or_callback(tmp_path, monkeypatch, count, clusters, budget):
     monkeypatch.setattr(core, 'read_rgb', lambda *args: pytest.fail('image processing before budget validation'))

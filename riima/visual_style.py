@@ -9,6 +9,10 @@ UI = dict(background='#F4F5F7', surface='#FFFFFF', canvas='#202020', border='#D6
           warning='#806000', danger='#B33226', on_canvas='#E8E8E8',
           canvas_muted='#BAC3CE', canvas_accent='#75B5FA', suggested='#098842')
 
+DESKTOP = dict(UI, background='#FAFAFA', border='#E4E4E7', control_border='#8C8C95',
+               text='#18181B', muted='#626269', accent='#27272A',
+               accent_hover='#3F3F46', accent_soft='#F0F0F2')
+
 DOCUMENT = dict(background=UI['background'], surface=UI['surface'], text=UI['text'],
                 muted=UI['muted'], border=UI['border'], accent=UI['accent'],
                 accent_soft=UI['accent_soft'], grid=UI['border'], axis=UI['muted'],

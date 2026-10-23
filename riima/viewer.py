@@ -97,14 +97,14 @@ def workspace_group_label(prepared: dict, group: int) -> str:
 def render_workspace(prepared: dict, display: str, *, selected_groups=None,
                      opacity: float = .5, contours: bool = False,
                      annotation_group: int | None = None, show_applied: bool = False) -> np.ndarray:
-    """Image, current overlay/classification or a binary mask of the selected groups."""
+    """Image, classification, selection mask or current valid analysis area."""
     current = workspace_data(prepared)
     labels = current['labels']
     assigned = current['valid'] & (labels >= 0)
     selected = workspace_mask(prepared, selected_groups)
     out = workspace_pixels(prepared, display, selected_groups=selected_groups, opacity=opacity,
                            annotation_group=annotation_group, show_applied=show_applied).reshape(current['base'].shape)
-    if contours:
+    if contours and display != 'Máscara':
         edges = boundary_mask(labels, valid=assigned)
         out[edges & selected] = WORKSPACE_CONTOUR_RGB
     return out
@@ -118,6 +118,8 @@ def workspace_pixels(prepared: dict, display: str, *, indices=None, selected_gro
         flat = array.reshape(-1, 3) if array.ndim == 3 else array.ravel()
         return flat if indices is None else flat[indices]
     base, labels, valid = pixels(current['base']), pixels(current['labels']), pixels(current['valid'])
+    if display == 'Máscara':
+        return np.repeat((valid.astype(np.uint8) * 255)[:, None], 3, axis=1)
     assigned = valid & (labels >= 0)
     selected = assigned.copy()
     if selected_groups is not None:
@@ -162,7 +164,9 @@ def workspace_sources(prepared: dict, selected_groups=None) -> list[dict]:
             dict(id='classification', label='Classificação atual',
                  render=lambda: render_workspace(prepared, 'Classificação')),
             dict(id='selection_mask', label='Máscara selecionada',
-                 render=lambda: render_workspace(prepared, 'Máscara selecionada', selected_groups=selected_groups))]
+                 render=lambda: render_workspace(prepared, 'Máscara selecionada', selected_groups=selected_groups)),
+            dict(id='analysis_mask', label='Máscara',
+                 render=lambda: render_workspace(prepared, 'Máscara'))]
 
 
 def workspace_legend(prepared: dict, selected_groups=None, *, mask=False) -> list[dict]:

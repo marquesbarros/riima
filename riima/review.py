@@ -912,8 +912,8 @@ def _validate_workspace(workspace, class_ids):
     for field in ('isolate', 'contours', 'show_applied', 'automatic_output'):
         if field in result and type(result[field]) is not bool:
             raise ValueError(f'Workspace inválido: {field} deve ser booleano.')
-    choices = dict(step=('preparation', 'interpretation', 'images', 'classify', 'organize', 'refine', 'results'),
-                   display=('Imagem', 'Sobreposição', 'Classificação', 'Máscara selecionada', 'Grupo selecionado'),
+    choices = dict(step=('workbench', 'preparation', 'interpretation', 'images', 'classify', 'organize', 'refine', 'results'),
+                   display=('Imagem', 'Sobreposição', 'Classificação', 'Máscara', 'Máscara selecionada', 'Grupo selecionado'),
                    view_type=('layers', 'compare'))
     for field, allowed in choices.items():
         if field in result and (not isinstance(result[field], str) or result[field] not in allowed):

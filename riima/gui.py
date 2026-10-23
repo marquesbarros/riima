@@ -24,21 +24,9 @@ from . import theme
 from . import review
 from . import metrics
 from .exports import export_batch, staged_directory, staged_file
-_MASK_MODE_LABELS = {
-    "Automática (conservadora)": "auto",
-    "Somente sobreposição comum": "overlap_only",
-}
-
-# UX safety threshold (not a scientific one): below this fraction of the registered
-# geometric overlap, the automatic specimen/annotation heuristic is removing enough area
-# that it is worth surfacing to the user, who can switch to "Somente sobreposição comum"
-# and compare. Chosen conservatively so ordinary slides never trigger it; not derived from
-# petrographic validation.
-_MASK_COVERAGE_WARN_RATIO = 0.70
-
-_WORKFLOW_STEPS = [('preparation', 'Preparação'), ('interpretation', 'Interpretação')]
-_STEP_ALIASES = dict(images='preparation', classify='preparation', organize='interpretation',
-                     refine='interpretation', results='interpretation')
+# Historical workspace labels are accepted without recreating stage navigation.
+_STEP_ALIASES = dict.fromkeys(('images', 'classify', 'organize', 'refine', 'results',
+                              'preparation', 'interpretation'), 'workbench')
 
 
 def gui(_test_hook=None) -> None:
@@ -133,6 +121,8 @@ def gui(_test_hook=None) -> None:
         widget.bind('<Destroy>', destroy, add='+')
         widget.bind('<FocusIn>', show, add='+')
         widget.bind('<F1>', show, add='+')
+        tip['hide'] = hide
+        tip['schedule'] = schedule
         return widget
 
     def action_button(parent, text, command, *, icon=None, description='', **options):
@@ -157,7 +147,6 @@ def gui(_test_hook=None) -> None:
     split_left_var = tk.StringVar()
     split_right_var = tk.StringVar()
     clusters_var = tk.IntVar(value=8)
-    mask_mode_var = tk.StringVar(value="Automática (conservadora)")
     status_var = tk.StringVar(value="Selecione uma ou mais imagens para começar.")
     summary_var = tk.StringVar(value="")
     preview_title_var = tk.StringVar(value="Prévia da lâmina")
@@ -166,10 +155,11 @@ def gui(_test_hook=None) -> None:
     review_image_var = tk.StringVar()
     review_cluster_var = tk.StringVar()
     review_display_var = tk.StringVar(value="Sobreposição")
-    workflow_var = tk.StringVar(value='preparation')
+    workflow_var = tk.StringVar(value='workbench')
     analysis_mode_var = tk.StringVar(value='Registradas (mesmo campo)')
     active_group_var = tk.StringVar(value='Grupo ativo: —')
     workflow_hint_var = tk.StringVar()
+    context_visible_var = tk.BooleanVar(value=True)
     isolate_var = tk.BooleanVar(value=False)
     contours_var = tk.BooleanVar(value=False)
     legacy_masks_var = tk.BooleanVar(value=False)
@@ -226,6 +216,8 @@ def gui(_test_hook=None) -> None:
         "group_selection_history": [],
         "operation_after": None,
         "operation_frame": 0,
+        "context_width": 288,
+        "hover_group": None,
     }
     retained_legend_rows = ()
     ui_thread = threading.get_ident()
@@ -355,7 +347,7 @@ def gui(_test_hook=None) -> None:
         session['project_dirty'] = True
 
     def workspace_settings():
-        return dict(step=workflow_var.get(), display=review_display_var.get(),
+        return dict(step='workbench', display=review_display_var.get(),
                     isolate=isolate_var.get(), contours=contours_var.get(),
                     show_applied=show_applied_var.get(), automatic_output=automatic_output_var.get(),
                     selected_groups=list(session['workspace_selected_groups']),
@@ -368,36 +360,14 @@ def gui(_test_hook=None) -> None:
         if prepared is not None:
             prepared['workspace'] = workspace_settings()
 
-    def go_to_step(step):
+    def go_to_step(_historical_step):
+        """Accept historical callback aliases inside the same continuous workbench."""
         if session['busy']:
             return
-        step = _STEP_ALIASES.get(step, step)
-        if step not in dict(_WORKFLOW_STEPS):
-            return
-        if step == 'interpretation' and session.get('prepared') is None:
-            return
-        workflow_var.set(step)
-        review_enabled_var.set(step == 'interpretation')
-        review_tool_var.set('pan')
-        if step == 'interpretation':
-            refresh_group_listboxes()
-        session['compare_cache'] = None
-        rebuild_compare_sources()
+        workflow_var.set('workbench')
+        review_enabled_var.set(session.get('prepared') is not None)
         change_preview()
-
         refresh_similarity_windows(selection_only=True)
-
-    def advance_step():
-        keys = [key for key, _ in _WORKFLOW_STEPS]
-        index = keys.index(workflow_var.get())
-        if index < len(keys) - 1:
-            go_to_step(keys[index + 1])
-
-    def previous_step():
-        keys = [key for key, _ in _WORKFLOW_STEPS]
-        index = keys.index(workflow_var.get())
-        if index:
-            go_to_step(keys[index - 1])
 
     def on_group_selection(_event=None):
         if session['busy']:
@@ -472,7 +442,9 @@ def gui(_test_hook=None) -> None:
                 suffix += 1
             out_var.set(str(directory))
         rebuild_image_rows()
-        go_to_step('preparation')
+        set_section_open('import', True)
+        set_section_open('configuration', True)
+        change_preview()
         status_var.set(
             f"{len(paths)} imagem(ns) selecionada(s) para nova análise. Marque as ativas e a referência, depois clique em Gerar classificação."
         )
@@ -487,8 +459,14 @@ def gui(_test_hook=None) -> None:
         if not images:
             prepared = session.get('prepared')
             if prepared is not None:
+                source_paths = {item['name']: item.get('path', '') for item in prepared['review'].items}
+                source_paths.update({entry['name']: entry['path']
+                                     for entry in prepared['optical'].get('registered_images', []) if entry.get('path')})
                 for name in prepared['optical']['image_names']:
-                    ttk.Label(images_list_frame, text=name).pack(anchor='w')
+                    label = ttk.Label(images_list_frame, text=name, takefocus=True)
+                    label.pack(anchor='w')
+                    source = source_paths.get(name)
+                    attach_tooltip(label, name + ('\n' + str(Path(source).resolve()) if source else ''))
                 ttk.Label(images_list_frame, text='Imagens incluídas no projeto. Para refazer a análise, selecione os arquivos originais.',
                           wraplength=216, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=5)
             else:
@@ -510,9 +488,13 @@ def gui(_test_hook=None) -> None:
             ref_button.pack(side='left', padx=(0, 3))
             reference_buttons[i] = ref_button
             name = meta["name"]
-            ttk.Label(row, text=name, width=13, anchor="w").pack(side="left")
-            status_lbl = ttk.Label(row, text=status_map.get(name, ""), foreground=theme.TEXT_SECONDARY)
+            source_text = name + "\n" + str(Path(meta["path"]).resolve())
+            name_lbl = ttk.Label(row, text=name, width=13, anchor="w", takefocus=True)
+            name_lbl.pack(side="left")
+            attach_tooltip(name_lbl, source_text)
+            status_lbl = ttk.Label(row, text=status_map.get(name, ""), foreground=theme.TEXT_SECONDARY, takefocus=True)
             status_lbl.pack(side="left")
+            attach_tooltip(status_lbl, lambda label=status_lbl, source=source_text: source + "\n" + label.cget("text"))
             session["_status_labels"][name] = status_lbl
         refresh_reference_buttons()
 
@@ -683,6 +665,11 @@ def gui(_test_hook=None) -> None:
         deletable = one and len(state.groups) > 1 and selected[0] not in state.completed and selected[0] not in state.background_groups
         group_action_buttons['delete'].config(state='normal' if deletable else 'disabled')
         activate_group_btn.config(state='normal' if selected else 'disabled')
+        clear_selection_btn.config(state='normal' if selected else 'disabled')
+        editable_selection = bool(selected) and not any(c in state.completed for c in selected)
+        for value, button in selection_background_buttons.items():
+            available = editable_selection and any((c not in state.background_groups) == value for c in selected)
+            button.config(state='normal' if available else 'disabled')
         for tool, button in review_tool_buttons.items():
             button.config(state='disabled' if (done or background) and tool in ('positive', 'negative', 'erase') else 'normal',
                           style='Selected.Icon.TButton' if tool == review_tool_var.get() else 'Icon.TButton')
@@ -693,6 +680,7 @@ def gui(_test_hook=None) -> None:
             f'{state.counts(state.selected_cluster)} px · {len(state.completed)} prontos · {len(state.background_groups)} fundo\n'
             f'Marcas: +{sum(counts[:n])} / −{sum(counts[n:])}'
             + (' · pendentes' if state.has_pending else ''))
+        refresh_export_actions()
 
     def clear_group_selection():
         if session['busy']:
@@ -829,6 +817,7 @@ def gui(_test_hook=None) -> None:
         session['compare_cache'] = None
         rebuild_compare_sources()
         change_preview()
+        status_var.set('Grupos atualizados. Há alterações não salvas.')
         return result
 
     def create_group_current():
@@ -882,6 +871,7 @@ def gui(_test_hook=None) -> None:
         session['compare_cache'] = None
         rebuild_compare_sources()
         change_preview()
+        status_var.set('Operação de grupos desfeita. Há alterações não salvas.')
 
     def refine_review_cluster():
         if session['busy']:
@@ -1090,19 +1080,16 @@ def gui(_test_hook=None) -> None:
             if entries and all(entry.get('path') for entry in entries):
                 session['images'] = [dict(path=entry['path'], name=entry['name']) for entry in entries]
         reference_var.set(prepared['optical']['reference_index'])
-        mask_mode_var.set(next(label for label, mode in _MASK_MODE_LABELS.items()
-                              if mode == prepared['optical']['mask_mode']))
         rebuild_image_rows()
         review_tool_var.set('pan')
         setup_review()
         refresh_group_listboxes()
         saved_workspace = prepared.get('workspace', {})
         automatic_output_var.set(bool(saved_workspace.get('automatic_output', True)))
-        restored_step = saved_workspace.get('step', 'refine' if prepared['review'].completed or prepared['review'].has_pending else 'organize')
-        workflow_var.set(_STEP_ALIASES.get(restored_step, restored_step))
-        if workflow_var.get() not in dict(_WORKFLOW_STEPS):
-            workflow_var.set('interpretation')
-        review_enabled_var.set(workflow_var.get() == 'interpretation')
+        workflow_var.set('workbench')
+        review_enabled_var.set(True)
+        set_section_open('import', False)
+        set_section_open('configuration', False)
         review_display_var.set(saved_workspace.get('display', 'Sobreposição'))
         isolate_var.set(bool(saved_workspace.get('isolate', True)))
         contours_var.set(bool(saved_workspace.get('contours', False)))
@@ -1149,7 +1136,7 @@ def gui(_test_hook=None) -> None:
         for c in state.class_ids:
             photo = ImageTk.PhotoImage(Image.new('RGB', (12, 12), tuple(int(v) for v in state.palette[c])), master=root)
             photos.append(photo)
-            status = ('protegido' if c in state.completed else 'fundo' if c in state.background_groups else
+            status = ('aprovado · protegido' if c in state.completed else 'fundo' if c in state.background_groups else
                       'vazio' if not counts.get(c, 0) else 'pendente' if c in state.dirty else 'em revisão')
             group_tree.insert('', 'end', iid=str(c), text=review_group_label(c), image=photo,
                               values=(c, status), tags=('active',) if c == state.selected_cluster else ())
@@ -1288,7 +1275,7 @@ def gui(_test_hook=None) -> None:
             selected = chosen if display == 'Máscara selecionada' or (
                 isolate_var.get() and display in ('Sobreposição', 'Grupo selecionado')) else None
             if selected == []:
-                ttk.Label(legend_rows, text='Selecione um ou mais grupos em Seleção e Agrupamento.', wraplength=210).pack(anchor='w')
+                ttk.Label(legend_rows, text='Selecione um ou mais grupos na lista de grupos.', wraplength=210).pack(anchor='w')
             _draw_legend_rows('current', viewer.workspace_legend(prepared, selected,
                                                                mask=display == 'Máscara selecionada'))
         if review_enabled_var.get():
@@ -1645,20 +1632,25 @@ def gui(_test_hook=None) -> None:
         if session['busy']:
             return
         prepared = session.get('prepared')
-        step = workflow_var.get()
-        hints = dict(preparation='Prepare imagens e gere a classificação.',
-                     interpretation='Selecione para inspecionar; ative um grupo para revisar.')
-        workflow_hint_var.set(hints[step])
-        for key, frame in step_frames.items():
-            if key == step:
-                frame.pack(fill='x', pady=(8, 0))
-            else:
-                frame.pack_forget()
+        workflow_hint_var.set('Selecione para inspecionar; ative um grupo para revisar.' if prepared is not None
+                              else 'Importe imagens do mesmo campo ou campos independentes.')
+        if prepared is not None:
+            groups_context.pack(fill='x', before=preparation_sections, pady=(0, 8))
+            refresh_review_controls()
+        else:
+            groups_context.pack_forget()
+            for button in (*group_action_buttons.values(), group_undo_btn, similarity_btn,
+                           activate_group_btn, clear_selection_btn, *selection_background_buttons.values(), *review_tool_buttons.values(),
+                           review_update_btn, review_undo_btn, review_reset_btn,
+                           review_approve_btn, review_reopen_btn):
+                button.config(state='disabled')
+        for name, variable in section_open_vars.items():
+            set_section_open(name, variable.get())
         family_group_frame.pack_forget()
         if prepared is not None and prepared['interpretation'].families:
-            legacy_masks_toggle.pack(fill='x', pady=(8, 0))
-            if step == 'interpretation' and legacy_masks_var.get():
-                family_group_frame.pack(fill='x', pady=(8, 0))
+            legacy_masks_toggle.pack(fill='x', pady=(6, 0))
+            if legacy_masks_var.get():
+                family_group_frame.pack(fill='x', pady=(6, 0))
         else:
             legacy_masks_toggle.pack_forget()
         layers_panel.pack_forget()
@@ -1671,17 +1663,12 @@ def gui(_test_hook=None) -> None:
         for mode, button in view_mode_buttons.items():
             button.config(style='Selected.TButton' if mode == view_type_var.get() else 'TButton')
         if prepared is not None:
-            diagnostics_frame.pack(fill='x', pady=(8, 0))
+            diagnostics_frame.pack(fill='x', pady=(4, 0))
+            state = prepared['review']
+            results_status_var.set(f'{len(state.completed)} grupos aprovados · {len(state.background_groups)} de fundo. '
+                                   + ('Há edições pendentes.' if state.has_pending else 'Classificação atualizada.'))
         else:
             diagnostics_frame.pack_forget()
-        for key, button in step_buttons.items():
-            available = key == 'preparation' or prepared is not None
-            button.config(state='normal' if available else 'disabled',
-                          style='Primary.TButton' if key == step else 'TButton')
-        if prepared is not None:
-            state = prepared['review']
-            results_status_var.set(f'{len(state.completed)} grupos prontos e {len(state.background_groups)} de fundo.\n'
-                                   + ('Há edições pendentes de atualização.' if state.has_pending else 'Classificação atualizada.'))
         refresh_export_actions()
 
     def change_preview():
@@ -2143,7 +2130,7 @@ def gui(_test_hook=None) -> None:
         previous = dict(session)
         previous_variables = [(variable, variable.get()) for variable in project_view_variables]
         start_time = time.perf_counter()
-        mask_mode = _MASK_MODE_LABELS.get(mask_mode_var.get(), 'auto')
+        mask_mode = 'auto'
         output = out_var.get()
         analyze_btn.config(state='disabled')
         def prepare_candidate():
@@ -2188,10 +2175,6 @@ def gui(_test_hook=None) -> None:
             raw = prepared['optical']
             if raw.get('overlap_status') == 'warn':
                 note += ' Atenção: sobreposição comum entre as imagens está baixa.'
-            overlap, valid = raw.get('overlap'), raw.get('valid')
-            if mask_mode == 'auto' and overlap is not None and valid is not None and overlap.mean() > 0:
-                if float(valid.mean()) / float(overlap.mean()) < _MASK_COVERAGE_WARN_RATIO:
-                    note += ' A máscara automática excluiu uma fração grande da área registrada; confira a máscara e compare com Somente sobreposição comum.'
             status_var.set(f"Análise concluída em {session['analysis_seconds']:.1f} s. Projeto salvo: {target.name}.{note}")
         except Exception as exc:
             session.clear()
@@ -2264,7 +2247,7 @@ def gui(_test_hook=None) -> None:
             return
         chosen = selected_workspace_groups()
         if not chosen:
-            messagebox.showinfo('Exportar máscara', 'Selecione um ou mais grupos em Seleção e Agrupamento.')
+            messagebox.showinfo('Exportar máscara', 'Selecione um ou mais grupos na lista de grupos.')
             return
         path = filedialog.asksaveasfilename(defaultextension='.png',
                                            initialfile='mascara_grupos_' + '_'.join(map(str, chosen)) + '.png',
@@ -2438,63 +2421,6 @@ def gui(_test_hook=None) -> None:
             status_var.set(f'Não foi possível calcular a similaridade: {exc}')
             return window if window.winfo_exists() else None
 
-    def open_mask_comparison():
-        """Inspect the stored analysis mask against its actual geometric support."""
-        prepared = session.get('prepared')
-        if prepared is None or session['busy']:
-            return
-        state = prepared['review']
-        independent = state.mode == 'independent'
-        item = state.items[state.selected_image if independent else 0]
-        raw = item['optical'] if independent else prepared['optical']
-        window = tk.Toplevel(root)
-        window.title('Conferir máscara de análise')
-        window.transient(root)
-        panel = ttk.Frame(window, padding=12)
-        panel.pack(fill='both', expand=True)
-        window.bind('<Escape>', lambda _e: window.destroy())
-        overlap = raw.get('overlap')
-        if overlap is None and not independent:
-            ttk.Label(panel, text='Comparação indisponível: este projeto histórico não preservou a sobreposição '
-                      'geométrica. A máscara atual foi mantida sem supor outra área válida.',
-                      wraplength=470).pack()
-            return window
-        valid = np.asarray(raw['valid'], dtype=bool)
-        if overlap is None:
-            overlap = np.ones(valid.shape, bool)
-        rgb = item['rgb'] if independent else raw['images'][state.selected_image]
-        ttk.Label(panel, text='Máscara usada × domínio geométrico', style='Section.TLabel').pack(anchor='w')
-        ttk.Label(panel, text=('Campo independente: o domínio geométrico é a imagem inteira.' if independent else
-                  'A sobreposição limita o domínio válido do registro; a máscara automática é uma heurística de fundo.'),
-                  wraplength=640, style='Muted.TLabel').pack(anchor='w', pady=(4, 8))
-        previews = ttk.Frame(panel)
-        previews.pack(fill='both', expand=True)
-        window._mask_photos = []
-        for column, (title, mask) in enumerate((('Máscara usada na análise', valid),
-                                               ('Somente domínio geométrico', np.asarray(overlap, bool)))):
-            frame = ttk.Frame(previews)
-            frame.grid(row=0, column=column, padx=(0, 10) if column == 0 else (0, 0), sticky='n')
-            pixels = int(mask.sum())
-            ttk.Label(frame, text=f'{title}\n{pixels} pixels ({100 * pixels / max(1, mask.size):.1f}%)',
-                      justify='left').pack(anchor='w')
-            overlay = np.array(rgb, copy=True)
-            overlay[~mask] //= 5
-            image = Image.fromarray(overlay)
-            image.thumbnail((300, 280), Image.Resampling.NEAREST)
-            photo = ImageTk.PhotoImage(image, master=root)
-            window._mask_photos.append(photo)
-            ttk.Label(frame, image=photo).pack(pady=(6, 0))
-        ttk.Label(panel, text='Áreas fora de cada máscara aparecem escurecidas. A comparação usa a máscara da análise '
-                  'inicial; exclusões manuais da revisão são preservadas separadamente.', wraplength=640,
-                  style='Muted.TLabel').pack(anchor='w', pady=(8, 0))
-        def choose_geometric():
-            mask_mode_var.set('Somente sobreposição comum')
-            status_var.set('Máscara selecionada para a próxima classificação; resultado atual preservado.')
-            window.destroy()
-        action_button(panel, 'Usar somente sobreposição na próxima análise', choose_geometric,
-                      description='Apenas seleciona a opção. Clique em Gerar classificação quando desejar recalcular.').pack(anchor='w', pady=(8, 0))
-        return window
-
     # ---------- shell ----------
     header = ttk.Frame(root, padding=(14, 10, 14, 6))
     header.pack(fill="x")
@@ -2531,25 +2457,31 @@ def gui(_test_hook=None) -> None:
     root.bind('<Control-s>', lambda _e: save_project_current() if not session['busy'] else None)
     root.bind('<Control-o>', lambda _e: open_project() if not session['busy'] else None)
     root.bind('<Control-Shift-S>', lambda _e: save_project_current(choose=True) if not session['busy'] else None)
-    stepbar = ttk.Frame(root, padding=(14, 3, 14, 6))
-    stepbar.pack(fill='x')
-    step_buttons = {}
-    for index, (key, label) in enumerate(_WORKFLOW_STEPS):
-        button = ttk.Button(stepbar, text=f'{index + 1}. {label}', command=lambda step=key: go_to_step(step))
-        button.pack(side='left', fill='x', expand=True, padx=3)
-        step_buttons[key] = button
-
     main = ttk.Frame(root, padding=(10, 4, 10, 4))
-    main.pack(fill="both", expand=True)
-    main.columnconfigure(1, weight=1)
-    main.rowconfigure(0, weight=1)
+    main.pack(fill='both', expand=True)
+    context_paned = tk.PanedWindow(main, orient='horizontal', sashwidth=6,
+                                  sashrelief='flat', borderwidth=0,
+                                  background=theme.BORDER, opaqueresize=True)
+    context_paned.pack(fill='both', expand=True)
+    sidebar_container = ttk.Frame(context_paned, width=288)
+    context_paned.add(sidebar_container, minsize=252, width=288, stretch='never')
 
-    # ---------- sidebar (scrollable: viewer stays dominant even at small window sizes) ----------
-    sidebar_container = ttk.Frame(main, width=272)
-    sidebar_container.grid(row=0, column=0, sticky="nsw")
-    sidebar_container.grid_propagate(False)
-    sidebar_container.pack_propagate(False)
-    sidebar_container.configure(width=272)
+    def toggle_context_panel(_event=None):
+        if session['busy']:
+            return
+        if context_visible_var.get():
+            session['context_width'] = sidebar_container.winfo_width()
+            context_paned.forget(sidebar_container)
+            context_visible_var.set(False)
+        else:
+            context_paned.add(sidebar_container, before=workspace, minsize=252,
+                              width=session['context_width'], stretch='never')
+            context_visible_var.set(True)
+        focus_panel_btn.config(text='Recolher painel' if context_visible_var.get() else 'Restaurar painel')
+        schedule_redraw()
+        return 'break'
+
+    root.bind('<F9>', toggle_context_panel)
 
     sidebar_canvas = tk.Canvas(sidebar_container, highlightthickness=0, bd=0, bg=theme.BG_APP)
     sidebar_scroll = ttk.Scrollbar(sidebar_container, orient="vertical", command=sidebar_canvas.yview)
@@ -2572,6 +2504,20 @@ def gui(_test_hook=None) -> None:
         sidebar_canvas.yview_moveto(offset / content)
     sidebar.bind('<Configure>', update_sidebar_scroll)
     sidebar_canvas.bind('<Configure>', update_sidebar_scroll)
+
+    def reveal_context_focus(event):
+        widget = event.widget
+        if not sidebar_container.winfo_ismapped() or not str(widget).startswith(str(sidebar) + '.'):
+            return
+        top = widget.winfo_rooty() - sidebar_canvas.winfo_rooty()
+        height = sidebar_canvas.winfo_height()
+        bottom = top + widget.winfo_height()
+        delta = top - 6 if top < 0 else bottom - height + 6 if bottom > height else 0
+        bounds = sidebar_canvas.bbox('all')
+        if delta and bounds and bounds[3] > height:
+            offset = sidebar_canvas.yview()[0] * bounds[3]
+            sidebar_canvas.yview_moveto(max(0, offset + delta) / bounds[3])
+    root.bind('<FocusIn>', reveal_context_focus, add='+')
 
     def _sidebar_wheel(event):
         region = sidebar_canvas.cget('scrollregion')
@@ -2597,14 +2543,51 @@ def gui(_test_hook=None) -> None:
     sidebar_container.bind("<Leave>", lambda _e: sidebar_canvas.unbind_all("<MouseWheel>"))
 
 
-    ttk.Label(sidebar, textvariable=workflow_hint_var, wraplength=216,
-              foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=(0, 8))
-    step_frames = {key: ttk.Frame(sidebar) for key, _ in _WORKFLOW_STEPS}
-    images_step = classify_step = step_frames['preparation']
-    organize_step = refine_step = step_frames['interpretation']
+    workflow_hint_label = ttk.Label(sidebar, foreground=theme.TEXT_SECONDARY)
+    workflow_hint_insets = workflow_hint_label.winfo_reqwidth()
+    workflow_hint_label.configure(textvariable=workflow_hint_var)
+    workflow_hint_label.pack(anchor='w', pady=(0, 6))
+
+    def wrap_workbench_hint(event):
+        padding = tuple(root.winfo_pixels(str(value)) for value in sidebar.cget('padding'))
+        available = event.width - padding[0] - padding[2] - workflow_hint_insets
+        workflow_hint_label.configure(wraplength=max(1, available))
+    sidebar.bind('<Configure>', wrap_workbench_hint, add='+')
+    groups_context = ttk.Frame(sidebar)
+    preparation_sections = ttk.Frame(sidebar)
+    preparation_sections.pack(fill='x')
+    section_frames, section_buttons, section_open_vars = {}, {}, {}
+
+    def set_section_open(name, opened):
+        if session['busy']:
+            return
+        section_open_vars[name].set(bool(opened))
+        section_buttons[name].config(image=desktop_icon('chevron_down' if opened else 'chevron_right'))
+        if opened:
+            section_frames[name].pack(fill='x', pady=(4, 6))
+        else:
+            section_frames[name].pack_forget()
+
+    def collapsible_section(parent, name, title, *, opened=False):
+        container = ttk.Frame(parent)
+        container.pack(fill='x', pady=(2, 0))
+        button = action_button(container, title,
+                               lambda: set_section_open(name, not section_open_vars[name].get()),
+                               icon='chevron_right', description='Expandir ou recolher esta seção sem alterar a análise.')
+        button._section_title = title
+        button.config(style='Section.TButton')
+        button.pack(fill='x')
+        section_buttons[name] = button
+        section_open_vars[name] = tk.BooleanVar(value=opened)
+        section_frames[name] = ttk.Frame(container, padding=(2, 0))
+        set_section_open(name, opened)
+        return section_frames[name]
+
+    images_step = collapsible_section(preparation_sections, 'import', 'Imagens', opened=True)
+    classify_step = collapsible_section(preparation_sections, 'configuration', 'Configuração')
+    organize_step = refine_step = groups_context
     results_status_var = tk.StringVar()
-    interpretation_slot = organize_step  # Compatibility for the existing callbacks.
-    ttk.Label(images_step, text="Imagens", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+    interpretation_slot = organize_step
     ttk.Button(images_step, text="Selecionar imagens...", command=choose_images).pack(fill="x", pady=(0, 4))
     images_list_frame = ttk.Frame(images_step)
     images_list_frame.pack(fill="x", pady=(0, 2))
@@ -2615,16 +2598,18 @@ def gui(_test_hook=None) -> None:
     ttk.Label(images_step, text="Pasta de resultados", foreground=theme.TEXT_SECONDARY).pack(anchor="w", pady=(0, 2))
     outrow = ttk.Frame(images_step)
     outrow.pack(fill="x")
-    ttk.Entry(outrow, textvariable=out_var, width=24).pack(side="left", fill="x", expand=True, padx=(0, 5))
-    ttk.Button(outrow, text="…", width=3, command=choose_out).pack(side="right")
-    ttk.Checkbutton(images_step, text='Pasta automática para novas imagens',
-                    variable=automatic_output_var).pack(anchor='w', pady=(4, 0))
+    output_directory_btn = ttk.Button(outrow, text="…", width=3, command=choose_out)
+    output_directory_btn.pack(side="right")
+    attach_tooltip(output_directory_btn, 'Escolher pasta de resultados — Define a pasta de exportação e desativa a pasta automática.')
+    ttk.Entry(outrow, textvariable=out_var, width=1).pack(side="left", fill="x", expand=True, padx=(0, 5))
+    automatic_output_check = ttk.Checkbutton(images_step, text='Pasta automática', variable=automatic_output_var)
+    automatic_output_check.pack(anchor='w', pady=(4, 0))
+    attach_tooltip(automatic_output_check, 'Pasta automática — Ao selecionar novas imagens, define uma nova pasta de resultados '
+                   'sem sobrescrever as anteriores. Desmarque para manter a pasta escolhida.')
 
-    ttk.Separator(images_step, orient="horizontal").pack(fill="x", pady=12)
-    ttk.Label(classify_step, text="Classificação", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
     ttk.Label(
         classify_step,
-        text="Defina K e a máscara antes de executar a análise.",
+        text="Alterar parâmetros requer nova análise; grupos e revisões atuais são preservados até sua confirmação.",
         wraplength=216, foreground=theme.TEXT_SECONDARY,
     ).pack(anchor="w", pady=(0, 6))
     clusters_row = ttk.Frame(classify_step); clusters_row.pack(fill="x", pady=(0, 4))
@@ -2635,16 +2620,6 @@ def gui(_test_hook=None) -> None:
     analysis_mode_combo.pack(fill='x', pady=(0, 5))
     attach_tooltip(analysis_mode_combo, 'Modo de análise — Registradas alinha imagens do mesmo campo. '
                    'Independentes compartilha a classificação óptica entre campos sem alinhá-los.')
-    mask_row = ttk.Frame(classify_step); mask_row.pack(fill="x", pady=(0, 4))
-    ttk.Label(mask_row, text="Máscara de análise").pack(side="left")
-    mask_combo = ttk.Combobox(
-        mask_row, textvariable=mask_mode_var, state="readonly", width=15,
-        values=list(_MASK_MODE_LABELS.keys()),
-    )
-    mask_combo.pack(side="right")
-    attach_tooltip(mask_combo, 'Máscara de análise — Automática busca remover fundo e anotações. '
-                   'Compare com Somente sobreposição comum se alguma área válida for excluída.')
-
     analyze_btn = ttk.Button(classify_step, text="Gerar classificação", style="Primary.TButton", command=analyze)
     analyze_btn.pack(fill="x", pady=(2, 6))
     ttk.Label(
@@ -2653,25 +2628,14 @@ def gui(_test_hook=None) -> None:
         wraplength=216, foreground=theme.TEXT_SECONDARY,
     ).pack(anchor="w", pady=(0, 4))
 
-    # A stable, always-packed slot: diagnostics_frame is shown/hidden inside it (see
-    # update_context_controls), which keeps this section's position fixed regardless of
-    # when that toggling first happens (plain classify_step.pack()/pack_forget() cycling would
-    # otherwise re-append the frame after every already-packed classify_step section, including
-    # "4. Resultados", the first time it is shown).
     diagnostics_slot = ttk.Frame(classify_step)
     diagnostics_slot.pack(fill="x")
-    # Deliberately compact (no LabelFrame/border): the diagnostic opens its own window, so
-    # this only needs to be one row, not a tall boxed section that pushes "3.
-    # Interpretação" out of view in a normal-height window.
     diagnostics_frame = ttk.Frame(diagnostics_slot, padding=(0, 4))
     ttk.Button(diagnostics_frame, text="Diagnóstico de K...", command=open_cluster_count_diagnostics).pack(fill="x")
     attach_tooltip(diagnostics_frame.winfo_children()[0],
                    'Diagnóstico de K — Compara separação estatística; a escolha final cabe ao especialista.')
-    action_button(diagnostics_frame, 'Conferir máscara', open_mask_comparison,
-                  description='Compare a máscara da análise com o domínio geométrico sem recalcular ou exportar.').pack(fill='x', pady=(4, 0))
-
-    ttk.Separator(classify_step, orient="horizontal").pack(fill="x", pady=12)
-    optical_group_frame = ttk.LabelFrame(organize_step, text="Grupos", padding=theme.SPACE_SM)
+    optical_group_frame = ttk.Frame(organize_step)
+    ttk.Label(optical_group_frame, text="Grupos", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
     group_list_frame = ttk.Frame(optical_group_frame)
     group_list_frame.pack(fill='x')
     group_tree = ttk.Treeview(group_list_frame, columns=('id', 'status'), show='tree headings',
@@ -2699,8 +2663,21 @@ def gui(_test_hook=None) -> None:
     group_tree.bind('<B1-Motion>', lambda _e: 'break' if session['busy'] else None)
     group_tree.bind('<Double-Button-1>', activate_selected_group)
     group_tree.bind('<Return>', activate_selected_group)
-    attach_tooltip(group_tree, 'Grupos — Clique seleciona; Shift/Ctrl + clique acrescenta ou remove. '
-                   'Enter ou duplo clique ativa o grupo para o pincel. A seleção para inspeção é independente do grupo ativo.')
+    def group_row_tooltip():
+        iid = session.get('hover_group') or group_tree.focus()
+        if iid and group_tree.exists(iid):
+            return (group_tree.item(iid, 'text') + ' · ID ' + iid + '\n'
+                    + str(group_tree.item(iid, 'values')[-1]) + '\n'
+                    + 'Clique seleciona; Shift/Ctrl amplia. Enter ou duplo clique ativa o pincel.')
+        return 'Grupos — Clique seleciona; Shift/Ctrl amplia. Enter ou duplo clique ativa o pincel.'
+    attach_tooltip(group_tree, group_row_tooltip)
+    def on_group_hover(event):
+        iid = group_tree.identify_row(event.y)
+        if iid != session.get('hover_group'):
+            session['hover_group'] = iid
+            tooltips[group_tree]['schedule']()
+    group_tree.bind('<Motion>', on_group_hover)
+    group_tree.bind('<Leave>', lambda _e: session.update(hover_group=None), add='+')
     manager_actions = ttk.Frame(optical_group_frame)
     manager_actions.pack(fill='x', pady=(4, 0))
     group_action_buttons = {}
@@ -2729,12 +2706,14 @@ def gui(_test_hook=None) -> None:
                                        description='Escolhe o primeiro grupo selecionado como destino das marcações.')
     activate_group_btn.config(compound='image', style='Icon.TButton'); activate_group_btn.pack(side='left', padx=4)
     background_actions = selection_actions
+    selection_background_buttons = {}
     for text, icon, value in [('Enviar seleção ao fundo', 'background', True), ('Restaurar seleção do fundo', 'restore', False)]:
         button = action_button(background_actions, text, lambda chosen=value: selected_groups_background(chosen), icon=icon)
         button.config(compound='image', style='Icon.TButton'); button.pack(side='left', padx=(0, 4))
+        selection_background_buttons[value] = button
 
     optical_group_frame.pack(fill="x")
-    review_frame = ttk.LabelFrame(refine_step, text='Revisão dos grupos', padding=theme.SPACE_SM)
+    review_frame = ttk.Frame(refine_step, padding=(0, 6, 0, 0))
     active_group_label = ttk.Label(review_frame, textvariable=active_group_var, wraplength=216,
                                     font=theme.font('body', bold=True))
     active_group_label.pack(fill='x', pady=(0, 4))
@@ -2749,8 +2728,6 @@ def gui(_test_hook=None) -> None:
             on_view_type_change()
         refresh_review_controls()
         change_preview()
-    tools_row.columnconfigure(0, weight=1)
-    tools_row.columnconfigure(1, weight=1)
     def choose_review_tool(tool):
         if session['busy']:
             return
@@ -2855,37 +2832,58 @@ def gui(_test_hook=None) -> None:
 
     review_frame.pack(fill='x')
 
-    # ---------- central preview + fixed legend viewport ----------
-    workspace = ttk.Frame(main)
-    workspace.grid(row=0, column=1, sticky="nsew")
+    # ---------- permanent scientific canvas ----------
+    workspace = ttk.Frame(context_paned)
+    context_paned.add(workspace, minsize=480, stretch='always')
     workspace.columnconfigure(0, weight=1)
     workspace.rowconfigure(1, weight=1)
 
     titlebar = ttk.Frame(workspace)
     titlebar.grid(row=0, column=0, sticky="ew", padx=(4, 0), pady=(2, 5))
     titlebar.columnconfigure(0, weight=1)
-    preview_title_label = ttk.Label(titlebar, textvariable=preview_title_var,
-                                    font=theme.font('viewer', bold=True), wraplength=320)
+    preview_title_label = ttk.Label(titlebar, font=theme.font('viewer', bold=True), wraplength=320)
+    preview_title_insets = preview_title_label.winfo_reqwidth()
+    preview_title_label.configure(textvariable=preview_title_var)
     preview_title_label.grid(row=0, column=0, sticky='ew', padx=(0, 8))
 
     zoom_toolbar = ttk.Frame(titlebar)
     zoom_toolbar.grid(row=0, column=1, sticky='e')
+    focus_panel_btn = action_button(zoom_toolbar, 'Recolher painel', toggle_context_panel, icon='panel',
+                                    compound='image', description='F9 — amplia a imagem e preserva zoom, seleção e revisão.')
+    tooltips[focus_panel_btn]['text'] = lambda: (
+        ('Recolher painel' if context_visible_var.get() else 'Restaurar painel')
+        + ' (F9) — preserva zoom, seleção, ferramenta e revisão.')
+    focus_panel_btn.pack(side='left', padx=(0, 5))
     action_button(zoom_toolbar, 'Diminuir zoom', lambda: zoom_button(1 / 1.25), icon='zoom_out', compound='image').pack(side='left', padx=1)
     action_button(zoom_toolbar, 'Aumentar zoom', lambda: zoom_button(1.25), icon='zoom_in', compound='image').pack(side='left', padx=1)
     ttk.Button(zoom_toolbar, text="Ajustar", command=set_fit_mode).pack(side="left", padx=1)
     ttk.Button(zoom_toolbar, text="Largura", command=set_width_mode).pack(side="left", padx=1)
     ttk.Button(zoom_toolbar, text="100%", command=set_100_mode).pack(side="left", padx=1)
-    titlebar.bind('<Configure>', lambda event: preview_title_label.config(
-        wraplength=max(80, event.width - zoom_toolbar.winfo_reqwidth() - 8)))
+    zoom_controls = tuple(zoom_toolbar.winfo_children())
+    for control in zoom_controls:
+        control.pack_forget()
+
+    def layout_viewer_title(event):
+        available = max(1, event.width)
+        toolbar_width = sum(control.winfo_reqwidth() + 2 for control in zoom_controls)
+        columns = len(zoom_controls) if toolbar_width <= available else 3
+        for index, control in enumerate(zoom_controls):
+            control.grid(row=index // columns, column=index % columns, sticky='w', padx=1, pady=1)
+        stacked = available < toolbar_width + 180
+        preview_title_label.grid_configure(row=0, column=0, columnspan=2 if stacked else 1)
+        zoom_toolbar.grid_configure(row=1 if stacked else 0, column=0 if stacked else 1,
+                                    columnspan=2 if stacked else 1, sticky='w' if stacked else 'e')
+        title_width = available if stacked else available - toolbar_width
+        preview_title_label.configure(wraplength=max(1, title_width - 8 - preview_title_insets))
+    titlebar.bind('<Configure>', layout_viewer_title)
 
     visual = ttk.Frame(workspace)
     visual.grid(row=1, column=0, sticky="nsew")
     visual.columnconfigure(0, weight=1)
-    visual.columnconfigure(1, weight=0, minsize=265)
     visual.rowconfigure(0, weight=1)
 
     preview_canvas = tk.Canvas(visual, bg=theme.BG_CANVAS, highlightthickness=0, bd=0)
-    preview_canvas.grid(row=0, column=0, sticky="nsew", padx=(4, 8))
+    preview_canvas.grid(row=0, column=0, sticky="nsew", padx=(4, 0))
     preview_canvas.bind("<Configure>", schedule_redraw)
     preview_canvas.bind("<ButtonPress-1>", on_canvas_press)
     preview_canvas.bind("<B1-Motion>", on_canvas_drag)
@@ -2898,10 +2896,8 @@ def gui(_test_hook=None) -> None:
     preview_canvas.bind("<Button-5>", on_canvas_wheel)      # Linux, wheel down
     sync_review_radius()
 
-    legend = ttk.LabelFrame(visual, text="Legenda", padding=6, width=260, height=520)
-    legend.grid(row=0, column=1, sticky="ns", padx=(0, 4))
-    legend.grid_propagate(False)
-    legend_canvas = tk.Canvas(legend, width=230, highlightthickness=0, bd=0, bg=theme.BG_APP)
+    legend = collapsible_section(sidebar, 'legend', 'Legenda científica')
+    legend_canvas = tk.Canvas(legend, width=230, height=220, highlightthickness=0, bd=0, bg=theme.BG_APP)
     legend_scroll = ttk.Scrollbar(legend, orient="vertical", command=legend_canvas.yview)
     legend_canvas.configure(yscrollcommand=legend_scroll.set)
     legend_canvas.pack(side="left", fill="both", expand=True)
@@ -2916,8 +2912,8 @@ def gui(_test_hook=None) -> None:
     view_type_row = ttk.Frame(workspace)
     view_type_row.grid(row=2, column=0, sticky='ew', padx=4, pady=(7, 2))
     ttk.Label(view_type_row, text='Imagem').pack(side='left', padx=(0, 5))
-    review_image_combo = ttk.Combobox(view_type_row, textvariable=review_image_var, state='readonly', width=29)
-    review_image_combo.pack(side='left', padx=(0, 15))
+    review_image_combo = ttk.Combobox(view_type_row, textvariable=review_image_var, state='readonly', width=24)
+    review_image_combo.pack(side='left', padx=(0, 8))
     review_image_combo.bind('<<ComboboxSelected>>', select_review_image)
     def choose_view_mode(mode):
         view_type_var.set(mode)
@@ -2926,21 +2922,49 @@ def gui(_test_hook=None) -> None:
         button = ttk.Button(view_type_row, text=text, command=lambda value=mode: choose_view_mode(value))
         button.pack(side='left', padx=(0, 7))
         view_mode_buttons[mode] = button
+    view_type_controls = tuple(view_type_row.winfo_children())
+    for control in view_type_controls:
+        control.pack_forget()
+
+    def layout_view_type_controls(event):
+        narrow = sum(control.winfo_reqwidth() + 8 for control in view_type_controls) > event.width
+        for index, control in enumerate(view_type_controls):
+            row = 1 if narrow and index >= 2 else 0
+            column = index - 2 if row else index
+            control.grid(row=row, column=column, sticky='w', padx=(0, 8), pady=1)
+    view_type_row.bind('<Configure>', layout_view_type_controls)
+
     view_controls = ttk.Frame(workspace)
     view_controls.grid(row=3, column=0, sticky='ew', padx=4, pady=(0, 4))
     display_controls = ttk.Frame(view_controls)
     display_controls.pack(fill='x', pady=4)
     review_display_combo = ttk.Combobox(display_controls, textvariable=review_display_var, state='readonly',
-                                       values=['Imagem', 'Sobreposição', 'Classificação', 'Máscara selecionada'], width=22)
+                                       values=['Imagem', 'Sobreposição', 'Classificação', 'Máscara selecionada', 'Máscara'], width=19)
     review_display_combo.pack(side='left', padx=(0, 8))
     review_display_combo.bind('<<ComboboxSelected>>', lambda _e: change_preview())
-    ttk.Checkbutton(display_controls, text='Destacar seleção', variable=isolate_var,
+    ttk.Checkbutton(display_controls, text='Isolar seleção', variable=isolate_var,
                     command=change_preview).pack(side='left', padx=(0, 8))
     ttk.Checkbutton(display_controls, text='Contornos', variable=contours_var,
                     command=change_preview).pack(side='left', padx=(0, 8))
     ttk.Label(display_controls, text='Opacidade').pack(side='left', padx=(0, 4))
-    ttk.Scale(display_controls, from_=0, to=100, variable=review_opacity_var, length=100,
+    ttk.Scale(display_controls, from_=0, to=100, variable=review_opacity_var, length=70,
               command=schedule_workspace_redraw).pack(side='left')
+    def wrap_display_controls(_event=None):
+        controls = display_controls.winfo_children()
+        for control in controls:
+            control.pack_forget()
+        available = max(1, display_controls.winfo_width())
+        row = column = used = 0
+        for control in controls:
+            needed = control.winfo_reqwidth() + 8
+            if used and used + needed > available:
+                row += 1
+                column = used = 0
+            control.grid(row=row, column=column, sticky='w', padx=(0, 8), pady=2)
+            used += needed
+            column += 1
+    display_controls.bind('<Configure>', wrap_display_controls)
+
     layers_panel = ttk.Frame(view_controls)  # No layer stack is exposed in the workspace.
     layers_list_frame = ttk.Frame(layers_panel)
     compare_panel = ttk.Frame(view_controls)
@@ -2952,6 +2976,16 @@ def gui(_test_hook=None) -> None:
     split_right_combo = ttk.Combobox(compare_panel, textvariable=split_right_var, state="readonly", width=16)
     split_right_combo.pack(side="left")
     split_right_combo.bind("<<ComboboxSelected>>", on_compare_source_change)
+    compare_controls = tuple(compare_panel.winfo_children())
+
+    def layout_compare_controls(event):
+        narrow = sum(control.winfo_reqwidth() + 8 for control in compare_controls) > event.width
+        for control in compare_controls:
+            control.pack_forget()
+        for index, control in enumerate(compare_controls):
+            control.grid(row=index // 2 if narrow else 0, column=index % 2 if narrow else index,
+                         sticky='w', padx=(0, 8), pady=1)
+    compare_panel.bind('<Configure>', layout_compare_controls)
     # compare_panel starts unpacked; on_view_type_change() shows/hides it vs layers_panel.
 
     footer = ttk.Frame(root, padding=(14, 5, 14, 10))
@@ -2991,10 +3025,11 @@ def gui(_test_hook=None) -> None:
     operation_status.pack(side='left', fill='x', expand=True)
     ttk.Label(footer, textvariable=summary_var, style="Summary.TLabel", wraplength=1200).pack(anchor="w", pady=(2, 0))
 
-    project_view_variables = tuple(value for value in locals().values() if isinstance(value, tk.Variable))
+    project_view_variables = (tuple(value for value in locals().values() if isinstance(value, tk.Variable))
+                              + tuple(section_open_vars.values()))
     project_view_buttons = (tuple(value for value in locals().values() if isinstance(value, ttk.Button))
                             + tuple(review_tool_buttons.values()) + tuple(view_mode_buttons.values())
-                            + tuple(step_buttons.values()))
+                            + tuple(section_buttons.values()))
     update_context_controls()
     root.protocol('WM_DELETE_WINDOW', close_app)
     root.after_idle(render_preview_canvas)

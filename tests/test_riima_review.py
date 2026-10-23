@@ -1782,3 +1782,85 @@ def test_merging_unannotated_groups_does_not_allocate_annotation_image_planes(tm
     assert not allocated, 'Groups without examples must not allocate full-image annotation buffers'
     assert state.class_ids == [0] and not state.has_pending
     assert all(not item['annotations'] and not item['applied_annotations'] for item in state.items)
+
+
+def test_delete_after_merge_preserves_eligible_population_learning_protection_and_resume(tmp_path):
+    from copy import deepcopy
+
+    prepared = eight_group_dataset(tmp_path)
+    state = prepared['review']
+    item = state.items[0]
+    indices = {c: int(np.flatnonzero(item['labels'] == c)[0]) for c in state.class_ids}
+    raw, centers = item['initial'].copy(), state.centers.copy()
+    state.approve(7)
+    state.exclude(0, [indices[6]])
+    state.refine_pending()
+    state.rename_group(0, 'Interfaces unidas')
+    state.recolor_group(0, (17, 39, 63))
+    state.annotate(0, 0, [indices[0]], 1)
+    state.annotate(0, 2, [indices[2]], 1)
+    state.annotate(0, 2, [indices[0]], -1)
+    state.refine_pending()
+    assert 2 in state.models
+    assert state.merge_groups([0, 1]) == 0
+    assert state.has_pending
+    state.refine_pending()
+    assert not state.has_pending and len(state.class_ids) == 7
+
+    groups, retired = deepcopy(state.groups), deepcopy(state.retired_groups)
+    labels, locked, excluded, valid = (item[key].copy() for key in ('labels', 'locked', 'excluded', 'valid'))
+    marks = {key: item[key][2].copy() for key in ('annotations', 'applied_annotations')}
+    palette, models, order = state.palette.copy(), dict(state.models), state.refinement_order.copy()
+    eligible = valid & ~excluded
+    removed_pixels = eligible & (labels == 0)
+    assert removed_pixels.any()
+
+    state.delete_group(0)
+
+    assert state.class_ids == [2, 3, 4, 5, 6, 7]
+    assert np.all(np.isin(item['labels'][eligible], state.class_ids))
+    assert np.count_nonzero(item['valid'] & (item['labels'] >= 0)) == int(eligible.sum())
+    assert np.all(item['labels'][removed_pixels] != 0)
+    assert np.all(item['labels'][excluded] == -1)
+    assert item['labels'].ravel()[indices[2]] == 2
+    assert item['labels'].ravel()[indices[0]] != 2
+    assert state.completed == {7} and state.models[2] is models[2]
+    assert state.retired_groups[1] == retired[1]
+    assert state.retired_groups[1]['reason'] == 'merged_into:0'
+    assert state.retired_groups[0] == dict(members=[0, 1], name='Interfaces unidas',
+                                          color=[17, 39, 63], reason='deleted')
+    for key, expected in (('initial', raw), ('valid', valid), ('locked', locked), ('excluded', excluded)):
+        np.testing.assert_array_equal(item[key], expected)
+    np.testing.assert_array_equal(item['labels'][locked >= 0], locked[locked >= 0])
+    np.testing.assert_array_equal(state.centers, centers)
+    np.testing.assert_array_equal(state.palette, palette)
+    for key, expected in marks.items():
+        np.testing.assert_array_equal(item[key][2], expected)
+    assert 0 not in state.models and all(0 not in item[key] for key in marks)
+
+    path = tmp_path / 'deleted-merged.riima'
+    review.save_project(prepared, path)
+    resumed = review.load_project(path)['review']
+    assert resumed.groups == state.groups and resumed.retired_groups == state.retired_groups
+    assert resumed.completed == {7} and resumed.next_group_id == 8
+    assert not resumed.has_pending and not resumed.can_undo_group
+    for key in ('labels', 'valid', 'excluded', 'applied_excluded', 'locked', 'initial'):
+        np.testing.assert_array_equal(resumed.items[0][key], item[key])
+    for key, expected in marks.items():
+        np.testing.assert_array_equal(resumed.items[0][key][2], expected)
+    np.testing.assert_array_equal(resumed.palette, palette)
+    np.testing.assert_array_equal(resumed.centers, centers)
+    features = state._features(item, np.flatnonzero(eligible))
+    np.testing.assert_array_equal(resumed.models[2].predict(features)[1], models[2].predict(features)[1])
+
+    assert state.undo_group_operation()
+    assert state.groups == groups and state.retired_groups == retired
+    assert state.refinement_order == order and state.completed == {7}
+    assert state.models.keys() == models.keys()
+    assert all(state.models[c] is model for c, model in models.items())
+    for key, expected in (('labels', labels), ('valid', valid), ('locked', locked), ('excluded', excluded), ('initial', raw)):
+        np.testing.assert_array_equal(item[key], expected)
+    for key, expected in marks.items():
+        np.testing.assert_array_equal(item[key][2], expected)
+    np.testing.assert_array_equal(state.palette, palette)
+    np.testing.assert_array_equal(state.centers, centers)

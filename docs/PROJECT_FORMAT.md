@@ -79,8 +79,10 @@ mesmo quando sozinha excede esse orçamento. Imagens, atributos e classificaçã
 automática não são copiados para o histórico. O projeto persiste o estado atual
 e a proveniência, sem gravar o histórico de Desfazer.
 
-O workspace aceita `step=preparation` e `step=interpretation`, além dos nomes
-históricos de etapas. `selected_groups` é independente de `selected_cluster`,
+O workspace usa `step=workbench` como marcador da bancada e aceita os nomes
+históricos `preparation`, `interpretation`, `images`, `classify`, `organize`,
+`refine` e `results`. O display `Máscara` apresenta o domínio válido atual;
+`Máscara selecionada` apresenta somente os grupos escolhidos. `selected_groups` é independente de `selected_cluster`,
 que identifica o grupo ativo para o pincel. Referências de seleção removidas
 são filtradas ao carregar.
 

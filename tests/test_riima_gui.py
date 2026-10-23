@@ -22,6 +22,901 @@ from riima import review
 from test_riima_core_optical import synthetic_registration_image, warp_test_image, write_rgb_images
 
 
+def _select_group_rows(app, first, last=None):
+    rows = app['group_tree'].get_children()
+    app['group_tree'].selection_add(rows[int(first):int(last if last is not None else first) + 1])
+
+
+def _group_row_indices(app):
+    rows = app['group_tree'].get_children()
+    return tuple(rows.index(iid) for iid in app['group_tree'].selection())
+
+
+def _group_texts(app):
+    tree = app['group_tree']
+    return tuple(tree.item(iid, 'text') + ' ' + str(tree.item(iid, 'values')) for iid in tree.get_children())
+
+
+@pytest.fixture(autouse=True)
+def confirm_replacement_by_default(app, monkeypatch):
+    """Legacy workflows explicitly consent to replacement unless a test overrides it."""
+    monkeypatch.setattr(app['messagebox'], 'askyesno', lambda *args, **kwargs: True)
+    app['analysis_mode_var'].set('Registradas (mesmo campo)')
+    for kind in ('showinfo', 'showwarning', 'showerror'):
+        monkeypatch.setattr(app['messagebox'], kind, lambda *args, **kwargs: pytest.fail(f'Unexpected dialog: {args}'))
+
+
+def test_two_environments_share_one_group_tree_and_independent_active_group(app, tmp_path):
+    from tkinter import ttk
+    from test_riima_review import prepared_dataset
+    assert list(app['step_buttons']) == ['preparation', 'interpretation']
+    assert isinstance(app['group_tree'], ttk.Treeview)
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('interpretation')
+    active = prepared['review'].selected_cluster
+    app['select_groups']([1])
+    assert prepared['review'].selected_cluster == active
+    assert app['selected_workspace_groups']() == [1]
+    assert app['group_tree'].selection() == ('1',)
+    app['activate_selected_group']()
+    assert prepared['review'].selected_cluster == 1
+    assert app['review_frame'].winfo_manager() == 'pack'
+    assert app['optical_group_frame'].winfo_manager() == 'pack'
+    assert app['sidebar_container'].winfo_width() == 272
+    for button in app['review_tool_buttons'].values():
+        assert button.cget('text') and str(button.cget('compound')) == 'image'
+    app['go_to_step']('preparation')
+    assert app['session']['prepared'] is prepared
+
+
+def test_new_input_staging_and_cancelled_replacement_preserve_current_analysis(app, tmp_path, monkeypatch):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    app['session'].update(prepared=prepared, project_path=str(tmp_path / 'previous.riima'))
+    app['setup_review']()
+    app['save_project_current']()
+    before = scientific_state(prepared)
+    archive = Path(app['session']['project_path']).read_bytes()
+    monkeypatch.setattr(app['filedialog'], 'askopenfilenames', lambda **kw: [prepared['review'].items[0]['path']])
+    app['choose_images']()
+    assert app['session']['prepared'] is prepared
+    assert scientific_state(prepared) == before
+    monkeypatch.setattr(app['messagebox'], 'askyesno', lambda *a, **kw: False)
+    app['analyze']()
+    assert app['session']['prepared'] is prepared
+    assert Path(app['session']['project_path']).read_bytes() == archive
+
+
+@pytest.mark.parametrize('aspect', ['actions', 'active_name', 'scroll', 'sidebar_scroll', 'preparation_labels'])
+def test_compact_interpretation_controls_fit_with_many_and_long_named_groups(app, tmp_path, aspect):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    long_name = ('Grupo de aparência óptica com nome extenso ' * 4).strip()
+    state.rename_group(state.selected_cluster, long_name)
+    for index in range(15):
+        state.create_group(f'Grupo adicional {index}')
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['root'].geometry('1080x700')
+    app['go_to_step']('interpretation')
+    app['root'].update()
+    if aspect == 'actions':
+        frame = app['manager_actions']
+        for button in frame.winfo_children():
+            assert button.winfo_x() + button.winfo_reqwidth() <= frame.winfo_width()
+            assert button.winfo_width() >= 28
+        assert app['background_actions'] is app['selection_actions']
+    elif aspect == 'active_name':
+        label = app['active_group_label']
+        assert label.winfo_height() <= 45
+        tip = app['tooltips'][label]['text']
+        assert long_name in (tip() if callable(tip) else tip)
+        assert state.group_name(state.selected_cluster) == long_name
+    elif aspect == 'scroll':
+        tree = app['group_tree']
+        assert tree.cget('yscrollcommand')
+        tree.event_generate('<MouseWheel>', delta=-120)
+        app['root'].update()
+        assert tree.yview()[0] > 0
+    elif aspect == 'sidebar_scroll':
+        scrollbar = app['sidebar_scroll']
+        canvas = app['sidebar_canvas']
+        container = app['sidebar_container']
+        assert scrollbar.winfo_ismapped()
+        assert scrollbar.winfo_width() >= 10
+        assert canvas.winfo_width() + scrollbar.winfo_width() <= container.winfo_width()
+        assert scrollbar.winfo_x() + scrollbar.winfo_width() <= container.winfo_width()
+        canvas.yview_moveto(1)
+        app['root'].update()
+        approval = app['review_approve_btn']
+        assert canvas.winfo_rooty() <= approval.winfo_rooty()
+        assert approval.winfo_rooty() + approval.winfo_height() <= canvas.winfo_rooty() + canvas.winfo_height()
+        canvas.yview_moveto(0)
+    else:
+        from tkinter import ttk
+        app['go_to_step']('preparation')
+        app['root'].update()
+        preparation = app['step_frames']['preparation']
+        descriptions = [child for child in preparation.winfo_children()
+                        if isinstance(child, ttk.Label) and int(child.cget('wraplength') or 0) > 0]
+        assert len(descriptions) == 2
+        assert all(label.winfo_reqwidth() <= preparation.winfo_width() for label in descriptions)
+
+
+def test_native_group_catalog_crud_and_undo_restore_selection(app, tmp_path, monkeypatch):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('interpretation')
+    app['select_groups']([0, 1])
+    original = [item['labels'].copy() for item in prepared['review'].items]
+    monkeypatch.setattr(app['simpledialog'], 'askstring', lambda *a, **kw: 'Novo grupo')
+    app['create_group_current']()
+    state = prepared['review']
+    created = state.selected_cluster
+    assert state.groups[created] == set()
+    assert app['group_tree'].exists(str(created))
+    assert 'vazio' in str(app['group_tree'].item(str(created), 'values'))
+    assert app['selected_workspace_groups']() == [created]
+    app['delete_group_current']()
+    assert created not in state.groups
+    app['undo_group_current']()
+    assert created in state.groups and app['selected_workspace_groups']() == [created]
+    app['undo_group_current']()
+    assert created not in state.groups and app['selected_workspace_groups']() == [0, 1]
+    for item, labels in zip(state.items, original):
+        np.testing.assert_array_equal(item['labels'], labels)
+
+
+def test_similarity_adds_selection_and_updates_names_without_recalculation(app, tmp_path):
+    from tkinter import ttk
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('interpretation')
+    app['select_groups']([0])
+    active = prepared['review'].selected_cluster
+    window = app['open_group_similarity']()
+    cached = app['session']['similarity_cache']
+    tree = next(child for child in window.winfo_children()[0].winfo_children() if isinstance(child, ttk.Treeview))
+    tree.selection_set('1')
+    tree.event_generate('<<TreeviewSelect>>')
+    assert app['selected_workspace_groups']() == [0, 1]
+    assert prepared['review'].selected_cluster == active
+    app['group_edit']('rename_group', 1, 'Nome em tempo real', presentation=True)
+    assert window.winfo_exists()
+    assert tree.item('1', 'text') == 'Nome em tempo real'
+    assert app['session']['similarity_cache'] is cached
+    window.destroy()
+
+
+def test_official_logo_rotates_in_ui_thread_and_stops_after_operation(app):
+    from tkinter import ttk
+    import threading
+    assert isinstance(app['operation_progress'], ttk.Label)
+    observations = []
+    release = threading.Event()
+    def sample():
+        observations.append((str(app['operation_progress'].cget('image')), app['session']['busy']))
+        if len(observations) < 3:
+            app['root'].after(70, sample)
+        else:
+            release.set()
+    app['root'].after(25, sample)
+    app['run_operation']('Animando logotipo', lambda: release.wait(5))
+    assert len({image for image, busy in observations if busy}) >= 2
+    assert app['session']['operation_after'] is None
+    assert not app['operation_progress'].winfo_ismapped()
+
+
+def test_replacement_project_failure_keeps_prior_analysis_and_archive(app, tmp_path, monkeypatch):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path, count=1)
+    app['session'].update(prepared=prepared, project_path=None,
+                          images=[dict(path=prepared['review'].items[0]['path'], name='field_0.png')])
+    app['setup_review']()
+    app['go_to_step']('preparation')
+    app['out_var'].set(prepared['output'])
+    app['rebuild_image_rows']()
+    assert app['save_project_current']()
+    archive = Path(app['session']['project_path'])
+    previous_bytes, before = archive.read_bytes(), scientific_state(prepared)
+    app['clusters_var'].set(3)
+    app['mask_mode_var'].set('Somente sobreposição comum')
+    app['analysis_mode_var'].set('Registradas (mesmo campo)')
+    save = review.save_project
+    def fail_new(data, path):
+        if data['config'].clusters == 3:
+            raise OSError('new checkpoint unavailable')
+        return save(data, path)
+    monkeypatch.setattr(review, 'save_project', fail_new)
+    errors = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *a: errors.append(a))
+    app['analyze']()
+    assert errors
+    assert app['session']['prepared'] is prepared
+    assert scientific_state(prepared) == before
+    assert app['session']['project_path'] == str(archive)
+    assert archive.read_bytes() == previous_bytes
+
+
+def test_group_noop_edits_do_not_consume_selection_undo_and_undo_marks_dirty(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['select_groups']([0, 1])
+    group = app['group_edit']('create_group', 'Novo')
+    app['group_edit']('rename_group', group, 'Renomeado', presentation=True)
+    app['select_groups']([0])
+    app['group_edit']('rename_group', group, 'Renomeado', presentation=True)
+    app['select_groups']([1])
+    app['group_edit']('recolor_group', group, tuple(prepared['review'].palette[group]), presentation=True)
+    app['session']['project_dirty'] = False
+    app['undo_group_current']()
+    assert app['session']['project_dirty']
+    assert prepared['review'].group_name(group) == 'Novo'
+    assert app['selected_workspace_groups']() == [group]
+    app['undo_group_current']()
+    assert group not in prepared['review'].groups
+    assert app['selected_workspace_groups']() == [0, 1]
+
+
+def test_legacy_metadata_does_not_overwrite_catalog_colors_or_select_empty_provenance(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    created = state.create_group('Vazio')
+    state.recolor_group(0, (1, 2, 3))
+    prepared['interpretation'].create_family([0], 'Associação histórica')
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['apply_interpretation']('rename_cluster', 0, 'Nome legado')
+    np.testing.assert_array_equal(state.palette[0], [1, 2, 3])
+    state.selected_cluster = created
+    app['family_group_list'].selection_set(0)
+    app['select_legacy_mask']()
+    assert app['selected_workspace_groups']() == [0]
+    assert state.selected_cluster == created
+
+
+def test_compact_global_actions_and_four_primary_steps(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    assert list(app['step_buttons']) == ['preparation', 'interpretation']
+    assert 'export_menu' in app, 'exports must stay accessible above the workspace'
+    prepared = prepared_dataset(tmp_path, count=1)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    app['refresh_export_actions']()
+    menu = app['export_menu']
+    assert str(menu.entrycget(0, 'state')) == 'normal'
+    prepared['review'].annotate(0, 0, [212], 1)
+    app['refresh_export_actions']()
+    assert str(menu.entrycget(0, 'state')) == 'disabled'
+    assert str(menu.entrycget(1, 'state')) == 'normal'
+    app['go_to_step']('results')
+    assert app['workflow_var'].get() == 'interpretation'
+    assert all(button.cget('image') for button in app['review_tool_buttons'].values())
+    assert all(button in app['tooltips'] for button in app['review_tool_buttons'].values())
+
+
+def test_default_gui_save_and_group_autosave_write_only_portable_project(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import file_bytes, scientific_state
+    prepared = prepared_dataset(tmp_path, count=1)
+    app['session'].update(prepared=prepared, project_path=None)
+    app['setup_review']()
+    prepared['review'].annotate(0, 0, [212], 1)
+    before = scientific_state(prepared)
+    assert app['autosave_current']()
+    output = Path(prepared['output'])
+    assert sorted(file_bytes(output)) == ['projeto.riima']
+    assert scientific_state(prepared) == before
+    previous_project = (output / 'projeto.riima').read_bytes()
+    app['apply_interpretation']('rename_cluster', 0, 'Live interpretation')
+    if app['session']['autosave_after']:
+        app['root'].after_cancel(app['session']['autosave_after'])
+    app['save_interpretation_metadata']()
+    assert (output / 'projeto.riima').read_bytes() == previous_project
+    assert app['session']['project_dirty']
+    assert app['save_project_current']()
+    assert not app['session']['project_dirty']
+    assert sorted(file_bytes(output)) == ['projeto.riima']
+    restored = review.load_project(output / 'projeto.riima')
+    assert restored['interpretation'].names[0] == 'Live interpretation'
+    assert restored['review'].has_pending
+
+
+def test_tooltips_identify_icon_actions_on_keyboard_focus(app):
+    assert 'tooltips' in app, 'compact controls need keyboard-accessible descriptions'
+    button = app['review_tool_buttons']['erase']
+    button.event_generate('<FocusIn>')
+    app['root'].update_idletasks()
+    tip = app['tooltips'][button]
+    assert tip['popup'] is not None and tip['popup'].winfo_exists()
+    assert 'Apagar marcas' in tip['text'] and 'exemplos' in tip['text']
+    button.event_generate('<FocusOut>')
+    assert tip['popup'] is None
+
+
+def test_status_indicator_reserves_space_without_moving_status_text(app):
+    root = app['root']
+    root.update_idletasks()
+    assert 'operation_slot' in app, 'the progress indicator needs a stable layout slot'
+    label = app['operation_status']
+    before = (label.winfo_x(), label.winfo_y(), label.winfo_width(), label.winfo_height())
+    observed = []
+    root.after(15, lambda: observed.append((label.winfo_x(), label.winfo_y(),
+                                           label.winfo_width(), label.winfo_height())))
+    app['run_operation']('Processando', lambda: time.sleep(.08))
+    root.update_idletasks()
+    assert observed == [before]
+    assert (label.winfo_x(), label.winfo_y(), label.winfo_width(), label.winfo_height()) == before
+    assert not app['operation_progress'].winfo_ismapped()
+
+
+def test_preview_title_does_not_push_zoom_controls_outside_small_window(app):
+    root = app['root']
+    previous_geometry, previous_title = root.geometry(), app['preview_title_var'].get()
+    try:
+        root.geometry('1080x700')
+        app['preview_title_var'].set('1: campo_sintetico_com_nome_muito_extenso_da_lâmina.png | Sobreposição')
+        root.update()
+        controls = app['zoom_toolbar'].winfo_children()
+        right = root.winfo_rootx() + root.winfo_width()
+        for button in controls:
+            assert button.winfo_ismapped()
+            assert button.winfo_rootx() + button.winfo_reqwidth() <= right, button.cget('text')
+    finally:
+        app['preview_title_var'].set(previous_title)
+        root.geometry(previous_geometry)
+
+
+def test_mask_comparison_shows_exact_support_without_export_or_reclassification(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import file_bytes, scientific_state
+    assert 'open_mask_comparison' in app, 'mask support must be inspectable alongside geometric overlap'
+    prepared = prepared_dataset(tmp_path, count=1)
+    raw = prepared['review'].items[0]['optical']
+    raw['valid'] = raw['valid'].copy()
+    raw['valid'][0, :4] = False
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    before, state = file_bytes(tmp_path), scientific_state(prepared)
+    window = app['open_mask_comparison']()
+    texts = ' '.join(_collect_label_texts(window))
+    assert '380 pixels' in texts and '384 pixels' in texts
+    assert 'independente' in texts.lower()
+    assert file_bytes(tmp_path) == before and scientific_state(prepared) == state
+    assert int(raw['valid'].sum()) == 380
+    window.destroy()
+
+
+def test_historical_registered_mask_missing_overlap_is_explicitly_unavailable(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    assert 'open_mask_comparison' in app
+    prepared = prepared_dataset(tmp_path, count=1)
+    prepared['review'].mode = 'registered'
+    prepared['optical'].pop('overlap', None)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    window = app['open_mask_comparison']()
+    assert 'indisponível' in ' '.join(_collect_label_texts(window)).lower()
+    assert 'overlap' not in prepared['optical']
+    window.destroy()
+
+
+def test_context_similarity_matches_reference_and_caches_science_only(app, tmp_path, monkeypatch):
+    import threading
+    from riima import report_data
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import file_bytes, scientific_state
+    assert 'open_group_similarity' in app, 'group comparison must work inside interpretation'
+    prepared = prepared_dataset(tmp_path, clusters=3)
+    state = prepared['review']
+    app['session'].update(prepared=prepared, workspace_selected_groups=[0])
+    app['setup_review']()
+    app['go_to_step']('organize')
+    before, science = file_bytes(tmp_path), scientific_state(prepared)
+    collect = report_data.collect_report_data
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(threading.get_ident())
+        return collect(*args, **kwargs)
+    monkeypatch.setattr(report_data, 'collect_report_data', counted)
+    window = app['open_group_similarity']()
+    rows = app['session']['similarity_rows']
+    reference = collect(prepared)
+    selected = reference['active'].index(next(i for i,g in enumerate(reference['groups']) if g['id'] == 0))
+    for row in rows:
+        other = reference['active'].index(next(i for i,g in enumerate(reference['groups']) if g['id'] == row['id']))
+        assert row['similarity'] == reference['similarity'][selected, other]
+    assert [r['similarity'] for r in rows] == sorted([r['similarity'] for r in rows], reverse=True)
+    assert calls and calls[0] != threading.get_ident()
+    assert file_bytes(tmp_path) == before and scientific_state(prepared) == science
+    window.destroy()
+    app['apply_interpretation']('rename_cluster', 1, 'Renamed without recalculation')
+    window = app['open_group_similarity']()
+    assert len(calls) == 1
+    assert any('Renamed without recalculation' in r['name'] for r in app['session']['similarity_rows'])
+    window.destroy()
+    state.exclude(0, [195], True)
+    notices = []
+    monkeypatch.setattr(app['messagebox'], 'showinfo', lambda *args: notices.append(args))
+    assert app['open_group_similarity']() is None
+    assert notices and len(calls) == 1
+    app['refine_review_cluster']()
+    window = app['open_group_similarity']()
+    assert len(calls) == 2
+    window.destroy()
+
+
+def test_similarity_dialog_closes_on_edits_without_discarding_presentation_cache(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path, clusters=3)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    app['session']['workspace_selected_groups'] = [0]
+    window = app['open_group_similarity']()
+    cached = app['session']['similarity_cache']
+    app['apply_interpretation']('rename_cluster', 1, 'New visible name')
+    assert window.winfo_exists(), 'renaming updates the open ranking without recomputing science'
+    assert app['session']['similarity_cache'] is cached
+    window = app['open_group_similarity']()
+    assert any('New visible name' in row['name'] for row in app['session']['similarity_rows'])
+    app['apply_interpretation']('recolor_cluster', 1, (9, 136, 66))
+    assert window.winfo_exists(), 'recoloring updates the open ranking without recomputing science'
+    assert app['session']['similarity_cache'] is cached
+    window = app['open_group_similarity']()
+    app['apply_interpretation']('merge_clusters', [0, 1])
+    assert not window.winfo_exists(), 'a nonmodal ranking must not retain obsolete group IDs'
+    assert app['session']['similarity_cache'] is None
+
+
+def test_disabled_listbox_events_cannot_change_selection_or_enable_review_during_worker(app, tmp_path):
+    import threading
+    from types import SimpleNamespace
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    box = app['optical_group_list']
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0)
+    app['on_group_selection']()
+    state.annotate(0, state.selected_cluster, [212], 1)
+    app['refresh_review_controls']()
+    before = scientific_state(prepared)
+    chosen, selected = list(app['session']['workspace_selected_groups']), _group_row_indices(app)
+    release = threading.Event()
+    observed = []
+    def inspect():
+        observed.append((_group_row_indices(app), list(app['session']['workspace_selected_groups']),
+                         scientific_state(prepared), app['review_update_btn'].instate(['disabled']),
+                         all(button.instate(['disabled']) for button in app['review_tool_buttons'].values())))
+        release.set()
+    def click_while_disabled():
+        bounds = box.bbox(1)
+        app['select_list_item'](SimpleNamespace(widget=box, y=bounds[1] + 2, state=0))
+        box.event_generate('<<TreeviewSelect>>', when='tail')
+        app['root'].after(15, inspect)
+    app['root'].after(15, click_while_disabled)
+    try:
+        app['run_operation']('Checking disabled controls', lambda: release.wait(5))
+    finally:
+        release.set()
+    assert observed == [(selected, chosen, before, True, True)]
+
+
+def test_review_mutators_cannot_change_scientific_state_during_worker(app, tmp_path, monkeypatch):
+    import threading
+    from test_riima_review import prepared_dataset
+    from test_export_integrity import scientific_state
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    app['session']['workspace_selected_groups'] = [0]
+    before = scientific_state(prepared)
+    release = threading.Event()
+    observations = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: None)
+    monkeypatch.setattr(app['messagebox'], 'showinfo', lambda *args: None)
+    def queued_callbacks():
+        for name, args in [('selected_groups_background', (True,)), ('reset_review_group', ()),
+                           ('apply_interpretation', ('rename_cluster', 0, 'Queued edit')),
+                           ('approve_review_cluster', ()), ('reopen_review_cluster', ())]:
+            app[name](*args)
+            observations.append((name, scientific_state(prepared)))
+        release.set()
+    app['root'].after(15, queued_callbacks)
+    try:
+        app['run_operation']('Checking queued commands', lambda: release.wait(5))
+    finally:
+        release.set()
+    assert observations
+    assert all(snapshot == before for _, snapshot in observations), [name for name, state in observations if state != before]
+
+
+@pytest.mark.parametrize('key', ['<Down>', '<Key-space>'])
+def test_busy_treeview_keyboard_cannot_change_selection(app, tmp_path, key):
+    import threading
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('interpretation')
+    tree = app['group_tree']
+    app['select_groups']([0])
+    tree.focus('1' if key == '<Key-space>' else '0')
+    app['root'].focus_force()
+    tree.focus_set()
+    app['root'].update()
+    observations, release = [], threading.Event()
+    def key_while_busy():
+        tree.event_generate(key)
+        def inspect():
+            observations.append((tree.selection(), app['selected_workspace_groups']()))
+            release.set()
+        app['root'].after(15, inspect)
+    app['root'].after(15, key_while_busy)
+    try:
+        app['run_operation']('Keyboard during calculation', lambda: release.wait(5))
+    finally:
+        release.set()
+    assert observations == [(('0',), [0])]
+
+
+def test_similarity_dialog_may_close_while_worker_finishes(app, tmp_path, monkeypatch):
+    import threading
+    from riima import report_data
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    app['session']['workspace_selected_groups'] = [0]
+    app['invalidate_similarity']()
+    release = threading.Event()
+    collect = report_data.collect_report_data
+    def delayed(*args, **kwargs):
+        assert release.wait(5)
+        return collect(*args, **kwargs)
+    monkeypatch.setattr(report_data, 'collect_report_data', delayed)
+    errors = []
+    monkeypatch.setattr(app['root'], 'report_callback_exception', lambda *args: errors.append(args))
+    def close_dialog():
+        windows = [w for w in app['root'].winfo_children()
+                   if isinstance(w, tk.Toplevel) and w.title() == 'Similaridade entre grupos']
+        assert len(windows) == 1
+        windows[0].destroy()
+        release.set()
+    app['root'].after(20, close_dialog)
+    try:
+        assert app['open_group_similarity']() is None
+        assert not errors and not app['session']['busy']
+    finally:
+        release.set()
+
+
+def test_similarity_long_names_wrap_and_keyboard_selection_reveals_full_candidate(app, tmp_path):
+    from tkinter import ttk, font as tkfont
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    selected_name = 'Grupo selecionado ' + 'caracterização petrográfica extensa ' * 5
+    candidate_name = 'Grupo comparado. ' + 'interpretação detalhada da lâmina ' * 5
+    prepared['interpretation'].names = {0: selected_name, 1: candidate_name}
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('organize')
+    app['session']['workspace_selected_groups'] = [0]
+    window = app['open_group_similarity']()
+    window.geometry('480x400')
+    app['root'].update()
+    panel = window.winfo_children()[0]
+    header = next(child for child in panel.winfo_children()
+                  if isinstance(child, ttk.Label) and selected_name in child.cget('text'))
+    assert tkfont.Font(font=header.cget('font') or 'TkDefaultFont').measure(selected_name) > window.winfo_width()
+    assert header.winfo_reqwidth() <= window.winfo_width() - 20
+    tree = next(child for child in panel.winfo_children() if isinstance(child, ttk.Treeview))
+    tree.focus_force()
+    tree.selection_set('1')
+    tree.focus('1')
+    tree.event_generate('<<TreeviewSelect>>')
+    app['root'].update()
+    assert any(candidate_name in text for text in _collect_label_texts(window))
+    full_name = next(child for child in panel.winfo_children()
+                     if isinstance(child, ttk.Label) and candidate_name in child.cget('text'))
+    assert 'Afinidade' in full_name.cget('text')
+    assert full_name.winfo_reqwidth() <= window.winfo_width() - 20
+    window.destroy()
+
+
+def test_review_radius_slider_has_integer_image_pixel_range(app, tmp_path):
+    from tkinter import ttk
+    from test_riima_review import prepared_dataset
+    app['session']['prepared'] = prepared_dataset(tmp_path)
+    app['setup_review']()
+    app['go_to_step']('refine')
+    app['root'].update()
+    scale = app['review_radius_scale']
+    assert isinstance(scale, ttk.Scale)
+    assert (float(scale['from']), float(scale['to'])) == (1, 150)
+    scale.set(149.7)
+    assert app['review_radius_var'].get() == 150
+    app['review_radius_var'].set(0)
+    assert app['review_radius_var'].get() == 1
+    app['review_radius_var'].set(151)
+    assert app['review_radius_var'].get() == 150
+    scale.focus_force()
+    app['root'].update()
+    scale.event_generate('<Left>')
+    assert app['review_radius_var'].get() == 149
+
+
+@pytest.mark.parametrize('zoom', [.5, 1, 4])
+def test_brush_outline_tracks_radius_without_redrawing_pixels(app, tmp_path, zoom):
+    from types import SimpleNamespace
+    from test_riima_review import prepared_dataset
+    app['session']['prepared'] = prepared_dataset(tmp_path)
+    app['setup_review']()
+    app['go_to_step']('refine')
+    app['review_tool_var'].set('positive')
+    app['review_radius_var'].set(7)
+    app['session']['viewport'] = viewer.ViewportState(zoom=zoom, center_x=12, center_y=8)
+    app['render_preview_canvas']()
+    canvas = app['preview_canvas']
+    raster = tuple(canvas.find_all())
+    before = app['session']['current_rgb'].copy()
+    app['on_canvas_motion'](SimpleNamespace(x=200, y=160))
+    circles = canvas.find_withtag('brush_cursor')
+    assert len(circles) == 2
+    assert canvas.coords(circles[0]) == pytest.approx([200-7*zoom, 160-7*zoom, 200+7*zoom, 160+7*zoom])
+    app['on_canvas_motion'](SimpleNamespace(x=210, y=170))
+    assert canvas.find_withtag('brush_cursor') == circles
+    assert all(item in canvas.find_all() for item in raster)
+    np.testing.assert_array_equal(before, app['session']['current_rgb'])
+    app['review_tool_var'].set('pan')
+    assert not canvas.find_withtag('brush_cursor')
+    app['review_tool_var'].set('restore')
+    app['on_canvas_motion'](SimpleNamespace(x=200, y=160))
+    assert canvas.find_withtag('brush_cursor')
+    canvas.event_generate('<Leave>')
+    assert not canvas.find_withtag('brush_cursor')
+    app['session']['compare_mode'] = True
+    app['on_canvas_motion'](SimpleNamespace(x=200, y=160))
+    assert not canvas.find_withtag('brush_cursor')
+    app['session']['compare_mode'] = False
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_processing_keeps_tk_responsive_and_restores_controls(app, fail):
+    import threading
+    root = app['root']
+    main_thread = threading.get_ident()
+    observed = []
+    ready = threading.Event()
+    release = threading.Event()
+    button = app['analyze_btn']
+    previous = button.state()
+
+    def heartbeat():
+        if not ready.is_set():
+            root.after(10, heartbeat)
+            return
+        observed.append((app['session']['busy'], button.instate(['disabled']),
+                         app['operation_progress'].winfo_ismapped(), app['status_var'].get()))
+        release.set()
+
+    def work():
+        assert threading.get_ident() != main_thread
+        app['set_status']('Etapa de teste')
+        ready.set()
+        assert release.wait(5)
+        if fail:
+            raise ValueError('falha controlada')
+        return 42
+
+    root.after(30, heartbeat)
+    if fail:
+        with pytest.raises(ValueError, match='falha controlada'):
+            app['run_operation']('Processando', work)
+    else:
+        assert app['run_operation']('Processando', work) == 42
+    assert observed and observed[0][:3] == (True, True, 1)
+    assert not app['session']['busy']
+    assert button.state() == previous
+    assert not app['operation_progress'].winfo_ismapped()
+
+
+def test_processing_preserves_outer_export_transaction(app, tmp_path):
+    from riima.exports import export_batch, staged_file
+    target = tmp_path / 'result.txt'
+    target.write_text('previous')
+    with pytest.raises(ValueError, match='rollback'):
+        with export_batch():
+            app['run_operation']('Salvando', lambda: staged_file(target).write_text('new'))
+            assert target.read_text() == 'previous'
+            raise ValueError('rollback')
+    assert target.read_text() == 'previous'
+
+
+def test_processing_collects_tk_variable_cycles_on_the_ui_thread(app, monkeypatch):
+    import gc
+    import threading
+    previous = gc.get_threshold()
+    gc.set_threshold(2**30, 2**30, 2**30)
+    variable = tk.IntVar(app['root'])
+    target_name = variable._name
+    cycle = [variable]
+    cycle.append(cycle)
+    finalizers = []
+    finalize = tk.Variable.__del__
+
+    def record_finalizer(value):
+        if value._name == target_name:
+            finalizers.append(threading.get_ident())
+        finalize(value)
+
+    monkeypatch.setattr(tk.Variable, '__del__', record_finalizer)
+    del variable, cycle
+
+    def allocations():
+        gc.set_threshold(1, 1, 1)
+        return len([[] for _ in range(200)])
+
+    try:
+        assert app['run_operation']('Processando', allocations) == 200
+        gc.collect()
+        assert finalizers == [threading.get_ident()]
+    finally:
+        gc.set_threshold(*previous)
+
+
+@pytest.mark.parametrize('mode', ['direct', 'trained', 'unavailable'])
+def test_review_feedback_and_generalization_through_native_gui(app, tmp_path, monkeypatch, mode):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    target = int(state.items[0]['initial'][8, 3])
+    state.selected_cluster = target
+    state.annotate(0, target, [8*24+20], 1)
+    if mode != 'direct':
+        state.annotate(0, target, [8*24+3], -1)
+    before = [item['labels'].copy() for item in state.items]
+    initial = [item['initial'].copy() for item in state.items]
+    errors = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: errors.append(args))
+    if mode == 'unavailable':
+        monkeypatch.delattr(cv2, 'ml')
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('refine')
+    app['refine_review_cluster']()
+    if mode == 'unavailable':
+        assert errors and 'RTrees_create' in errors[0][1]
+        assert state.has_pending
+        assert not state.models
+        for item, previous in zip(state.items, before):
+            np.testing.assert_array_equal(item['labels'], previous)
+    else:
+        assert not errors and not state.has_pending
+        if mode == 'direct':
+            assert 'Suporte óptico local aplicado' in app['status_var'].get()
+            assert target not in state.models
+            assert state.items[1]['labels'][8, 23] == target  # Exact Lab/T match, never marked.
+            assert np.all(state.items[1]['labels'][:, 21:] == target)
+            assert np.all(state.items[1]['labels'][:, :14] == before[1][:, :14])
+            assert state.items[0]['labels'][8, 20] == target
+        else:
+            assert 'Modelo treinado' in app['status_var'].get()
+            assert target in state.models
+            assert np.all(state.items[1]['labels'][:, 14:] == target)
+            assert np.all(state.items[1]['labels'][:, :14] != target)
+            assert state.items[0]['labels'][8, 20] == target
+            assert state.items[0]['labels'][8, 3] != target
+    for item, original in zip(state.items, initial):
+        np.testing.assert_array_equal(item['initial'], original)
+    assert not app['session']['busy']
+
+
+def test_autosave_publication_keeps_event_loop_alive(app, tmp_path, monkeypatch):
+    import threading
+    from riima import exports
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session'].update(prepared=prepared, project_path=str(tmp_path / 'project.riima'))
+    app['setup_review']()
+    app['go_to_step']('refine')
+    ui_thread = threading.get_ident()
+    original = exports._Export.publish
+    publishing = threading.Event()
+    heartbeat = threading.Event()
+    observations = []
+
+    def publish(operation):
+        publishing.set()
+        assert threading.get_ident() != ui_thread, 'Publication blocks the Tk thread'
+        assert heartbeat.wait(5)
+        return original(operation)
+
+    def tick():
+        if not publishing.is_set():
+            app['root'].after(10, tick)
+            return
+        observations.append((app['session']['busy'], app['operation_progress'].winfo_ismapped()))
+        heartbeat.set()
+
+    monkeypatch.setattr(exports._Export, 'publish', publish)
+    errors = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: errors.append(args))
+    timer = app['root'].after(10, tick)
+    try:
+        assert app['autosave_current']()
+        assert not errors
+        assert observations == [(True, 1)]
+        assert Path(app['session']['project_path']).is_file()
+    finally:
+        app['root'].after_cancel(timer)
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_closing_diagnostics_during_processing_does_not_touch_destroyed_widgets(app, tmp_path, monkeypatch, fail):
+    import threading
+    from test_riima_review import prepared_dataset
+    app['session']['prepared'] = prepared_dataset(tmp_path)
+    app['setup_review']()
+    root = app['root']
+    release = threading.Event()
+    errors = []
+    monkeypatch.setattr(root, 'report_callback_exception', lambda *args: errors.append(args))
+    evaluate = core.evaluate_cluster_counts
+
+    def delayed(*args, **kwargs):
+        assert release.wait(5)
+        if fail:
+            raise ValueError('diagnostic failure')
+        return evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(core, 'evaluate_cluster_counts', delayed)
+    previous = set(root.winfo_children())
+    app['open_cluster_count_diagnostics']()
+    window, = [w for w in root.winfo_children() if w not in previous and isinstance(w, tk.Toplevel)]
+
+    def close_when_running():
+        if not app['session']['busy']:
+            root.after(10, close_when_running)
+            return
+        window.destroy()
+        release.set()
+
+    root.after(10, close_when_running)
+    deadline = time.monotonic() + 6
+    try:
+        while not release.is_set() and time.monotonic() < deadline:
+            root.update()
+        assert release.is_set()
+        assert not errors
+        assert not app['session']['busy']
+        assert not window.winfo_exists()
+    finally:
+        release.set()
+        if window.winfo_exists():
+            window.destroy()
+
+
 @pytest.mark.parametrize('geometry', ['1280x820', '1080x700'])
 def test_workflow_controls_fit_the_sidebar(app, tmp_path, geometry):
     from tkinter import ttk
@@ -44,7 +939,8 @@ def test_workflow_controls_fit_the_sidebar(app, tmp_path, geometry):
             root.update()
             canvas = app['sidebar_canvas']
             left, right = canvas.winfo_rootx(), canvas.winfo_rootx() + canvas.winfo_width()
-            for child in descendants(app['step_frames'][step]):
+            expected_step = riima_gui._STEP_ALIASES.get(step, step)
+            for child in descendants(app['step_frames'][expected_step]):
                 if child.winfo_ismapped() and isinstance(child, (
                         ttk.Button, ttk.Checkbutton, ttk.Radiobutton, ttk.Combobox, tk.Listbox)):
                     x = child.winfo_rootx()
@@ -80,6 +976,7 @@ def test_failed_reclassification_keeps_the_current_review_and_workspace(app, tmp
     before = session['current_rgb'].copy()
     viewport = session['viewport']
     approved = state.items[0]['locked'].copy()
+    assert app['save_project_current']()
     messages = []
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: messages.append(args))
     if failure == 'invalid_k':
@@ -94,7 +991,7 @@ def test_failed_reclassification_keeps_the_current_review_and_workspace(app, tmp
     assert session['viewport'] is viewport
     assert app['view_type_var'].get() == 'compare'
     assert session['compare_mode']
-    assert app['workflow_var'].get() == 'classify'
+    assert app['workflow_var'].get() == 'preparation'
     np.testing.assert_array_equal(session['current_rgb'], before)
     np.testing.assert_array_equal(state.items[0]['locked'], approved)
     assert state.has_pending and state.items[0]['annotations'][0].flat[pixel] == 1
@@ -111,20 +1008,20 @@ def test_results_report_button_exports_html_and_cancellation_does_not_compute(ap
     app['session']['prepared'] = prepared
     app['setup_review']()
     app['go_to_step']('results')
-    buttons = [w for w in app['step_frames']['results'].winfo_children() if _text_of(w) == 'Exportar relatório']
-    assert len(buttons) == 1
+    menu = app['export_menu']
+    assert menu.entrycget(0, 'label') == 'Relatório descritivo (HTML)'
     target = tmp_path / 'report.html'
     with monkeypatch.context() as cancel:
         cancel.setattr(app['filedialog'], 'asksaveasfilename', lambda **kw: '')
         cancel.setattr(riima_metrics, 'export_metrics', lambda *a, **kw: pytest.fail('calculation after cancellation'))
-        buttons[0].invoke()
+        menu.invoke(0)
     assert not target.exists()
     monkeypatch.setattr(app['filedialog'], 'asksaveasfilename', lambda **kw: str(target))
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda title, text: pytest.fail(text))
-    buttons[0].invoke()
+    menu.invoke(0)
     html = target.read_text(encoding='utf-8')
     assert html.index('id="classificacao"') < html.index('id="tamanho"')
-    assert app['workflow_var'].get() == 'results'
+    assert app['workflow_var'].get() == 'interpretation'
     assert app['session']['prepared'] is prepared
 
 
@@ -190,16 +1087,21 @@ def test_click_replaces_group_selection_and_shift_adds_individual_groups(app, tm
         groups.event_generate('<ButtonPress-1>', x=x + 4, y=y + height // 2, state=state)
         groups.event_generate('<ButtonRelease-1>', x=x + 4, y=y + height // 2, state=state)
         app['root'].update()
+    app['root'].focus_force()
+    app['preview_canvas'].focus_set()
+    app['root'].update()
+    assert app['root'].focus_get() is app['preview_canvas']
     click(0)
+    assert app['root'].focus_get() is groups
     click(2)
-    assert groups.curselection() == (2,)
+    assert _group_row_indices(app) == (2,)
     click(0, 1)  # Shift adds a nonadjacent group without selecting the intervening one.
-    assert groups.curselection() == (0, 2)
+    assert _group_row_indices(app) == (0, 2)
     assert app['selected_workspace_groups']() == [0, 2]
     click(0, 1)
-    assert groups.curselection() == (2,)
-    click(1, 4)  # Ctrl without Shift still replaces the selection.
-    assert groups.curselection() == (1,)
+    assert _group_row_indices(app) == (2,)
+    click(1, 4)  # Ctrl toggles another individual group.
+    assert set(_group_row_indices(app)) == {1, 2}
     for item, labels in zip(prepared['review'].items, before):
         np.testing.assert_array_equal(item['labels'], labels)
 
@@ -225,37 +1127,37 @@ def test_complete_registered_workflow_reviews_resumes_and_exports_consistent_res
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda title, text: pytest.fail(text))
     app['automatic_output_var'].set(True)
     app['choose_images']()
-    app['next_btn'].invoke()
+    app['go_to_step']('preparation')
     app['clusters_var'].set(4)
     app['mask_mode_var'].set('Somente sobreposição comum')
     app['analyze_btn'].invoke()
     prepared = app['session']['prepared']
     assert prepared['optical']['sample_X'].shape[1] == 8
-    assert app['workflow_var'].get() == 'classify'
-    app['next_btn'].invoke()
+    assert app['workflow_var'].get() == 'preparation'
+    app['go_to_step']('interpretation')
     groups = app['optical_group_list']
-    groups.selection_clear(0, 'end')
-    groups.selection_set(0)
-    groups.selection_set(3)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0)
+    _select_group_rows(app, 3)
     app['on_group_selection']()
     app['merge_optical_selected']()
     state = prepared['review']
     assert state.groups == {0: {0, 3}, 1: {1}, 2: {2}}
-    groups.selection_clear(0, 'end')
-    groups.selection_set(0)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0)
     app['on_group_selection']()
     monkeypatch.setattr(app['simpledialog'], 'askstring', lambda *args, **kw: 'Grupo <á & ç>')
     app['rename_selected_group'](groups, 'cluster')
     monkeypatch.setattr(app['colorchooser'], 'askcolor', lambda **kw: ((9, 136, 66), '#098842'))
     app['recolor_selected_group'](groups, 'cluster')
-    app['next_btn'].invoke()
-    app['review_cluster_combo'].current(state.class_ids.index(0))
+    app['go_to_step']('interpretation')
+    app['group_tree'].selection_set(()); _select_group_rows(app, state.class_ids.index(0))
     app['select_review_cluster']()
     app['review_approve_btn'].invoke()
     item = state.items[0]
     raw = item['initial'].copy()
     frozen = item['locked'].copy()
-    app['review_cluster_combo'].current(state.class_ids.index(1))
+    app['group_tree'].selection_set(()); _select_group_rows(app, state.class_ids.index(1))
     app['select_review_cluster']()
     app['review_display_var'].set('Máscara selecionada')
     app['change_preview']()
@@ -324,6 +1226,7 @@ def test_complete_registered_workflow_reviews_resumes_and_exports_consistent_res
     final = next(img for img in parser.images if img.get('class') == 'classification-map')
     actual = np.asarray(Image.open(io.BytesIO(base64.b64decode(final['src'].split(',', 1)[1]))))
     np.testing.assert_array_equal(actual, viewer.render_workspace(prepared, 'Classificação'))
+    app['export_light_metrics']()  # CSVs are an explicit export, independent of portable HTML.
     with (Path(prepared['output']) / 'metrics' / 'group_summary.csv').open(encoding='utf-8-sig', newline='') as file:
         rows = list(csv.DictReader(file))
     for row in rows:
@@ -332,7 +1235,8 @@ def test_complete_registered_workflow_reviews_resumes_and_exports_consistent_res
 
 
 @pytest.mark.parametrize('image_count', [1, 2])
-def test_classification_stays_in_current_stage_for_k_evaluation(app, tmp_path, monkeypatch, image_count):
+@pytest.mark.parametrize('mode', ['registered', 'independent'])
+def test_classification_stays_in_current_stage_for_k_evaluation(app, tmp_path, monkeypatch, image_count, mode):
     rgb = synthetic_registration_image()
     paths = write_rgb_images(tmp_path, [rgb, warp_test_image(rgb, dx=3, dy=-2)][:image_count])
     app['session']['prepared'] = None
@@ -341,18 +1245,45 @@ def test_classification_stays_in_current_stage_for_k_evaluation(app, tmp_path, m
     app['reference_var'].set(0)
     app['mask_mode_var'].set('Somente sobreposição comum')
     app['clusters_var'].set(2)
+    app['analysis_mode_var'].set('Independentes (campos distintos)' if mode == 'independent' else 'Registradas (mesmo campo)')
     app['out_var'].set(str(tmp_path / 'new-analysis'))
     app['go_to_step']('classify')
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda title, text: pytest.fail(text))
     app['analyze']()
-    assert app['workflow_var'].get() == 'classify'
-    assert app['step_frames']['classify'].winfo_manager() == 'pack'
-    assert app['step_frames']['organize'].winfo_manager() == ''
+    assert app['workflow_var'].get() == 'preparation'
+    assert app['step_frames']['preparation'].winfo_manager() == 'pack'
+    assert app['step_frames']['interpretation'].winfo_manager() == ''
     prepared = app['session']['prepared']
-    assert prepared['optical']['sample_X'].shape[1] == 4 * image_count
-    assert prepared['review'].mode == 'registered'
-    assert len(prepared['review'].items) == 1
-    assert len(prepared['optical']['registered_images']) == image_count
+    assert prepared['optical']['sample_X'].shape[1] == (4 * image_count if mode == 'registered' else 4)
+    assert prepared['review'].mode == mode
+    assert len(prepared['review'].items) == (1 if mode == 'registered' else image_count)
+    assert len(prepared['optical']['registered_images']) == (image_count if mode == 'registered' else 1)
+    assert sorted(p.relative_to(prepared['output']).as_posix()
+                  for p in Path(prepared['output']).rglob('*') if p.is_file()) == ['projeto.riima']
+    if mode == 'independent' and image_count == 2:
+        from test_export_integrity import scientific_state
+        state = prepared['review']
+        pixel = int(np.flatnonzero(state.items[0]['valid'])[0])
+        state.annotate(0, state.selected_cluster, [pixel], 1)
+        before = scientific_state(prepared)
+        previous_path = app['session']['project_path']
+        app['analyze']()
+        assert app['session']['prepared'] is not prepared
+        assert Path(app['session']['project_path']).name == 'projeto_2.riima'
+        assert scientific_state(prepared) == before
+        restored = review.load_project(previous_path)['review']
+        assert restored.has_pending and restored.dirty == state.dirty
+        assert restored.groups == state.groups and restored.completed == state.completed
+        np.testing.assert_array_equal(restored.palette, state.palette)
+        np.testing.assert_array_equal(restored.centers, state.centers)
+        for saved, original in zip(restored.items, state.items):
+            for field in ('rgb', 'initial', 'labels', 'locked', 'valid', 'display_valid'):
+                np.testing.assert_array_equal(saved[field], original[field])
+            np.testing.assert_array_equal(saved['optical']['confidence'], original['optical']['confidence'])
+            assert saved['annotations'].keys() == original['annotations'].keys()
+            for cluster in original['annotations']:
+                np.testing.assert_array_equal(saved['annotations'][cluster], original['annotations'][cluster])
+        assert sorted(p.name for p in Path(prepared['output']).iterdir()) == ['projeto.riima', 'projeto_2.riima']
 
 
 def test_new_images_save_current_analysis_and_start_with_separate_output(app, tmp_path, monkeypatch):
@@ -368,6 +1299,7 @@ def test_new_images_save_current_analysis_and_start_with_separate_output(app, tm
     app['out_var'].set(old['output'])
     app['session']['images'] = [dict(path=item['path'], name=item['name']) for item in old['review'].items]
     app['setup_review']()
+    assert app['save_project_current']()
     new_folder = tmp_path / 'another-field'
     new_folder.mkdir()
     (new_folder / 'riima_output').mkdir()  # Existing results must not be overwritten.
@@ -385,9 +1317,8 @@ def test_new_images_save_current_analysis_and_start_with_separate_output(app, tm
     assert restored['output'] == str(tmp_path / 'previous_output')
     assert not Path(restored['output']).exists()
     assert not Path(old['output']).exists()
-    assert app['session']['prepared'] is None
-    assert app['session']['project_path'] is None
-    assert app['session']['current_rgb'] is None
+    assert app['session']['prepared'] is old
+    assert app['session']['project_path'] == str(old_project)
     assert Path(app['out_var'].get()).parent == new_folder
     assert Path(app['out_var'].get()).name == 'riima_output_2'
     assert app['session']['images'][0]['path'] == str(new_image)
@@ -409,8 +1340,10 @@ def test_new_image_picker_cancel_and_save_failure_preserve_current_analysis(app,
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: None)
     app['choose_images']()
     assert app['session']['prepared'] is old
-    assert app['session']['images'] == old_images
-    assert app['out_var'].get() == old['output']
+    assert app['session']['images'][0]['path'] == str(tmp_path / 'new.png')
+    app['analyze']()
+    assert app['session']['prepared'] is old
+    assert old['output'] == str(tmp_path / 'out')
 
 
 def test_manual_output_remains_selected_when_automatic_folder_is_disabled(app, tmp_path, monkeypatch):
@@ -480,13 +1413,13 @@ def test_clear_selection_removes_mask_without_modifying_classification(app, tmp_
     app['setup_review']()
     app['go_to_step']('organize')
     app['refresh_group_listboxes']()
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['on_group_selection']()
     app['review_display_var'].set('Máscara selecionada')
     before = [item['labels'].copy() for item in prepared['review'].items]
     app['clear_group_selection']()
     assert app['selected_workspace_groups']() == []
-    assert app['optical_group_list'].curselection() == ()
+    assert _group_row_indices(app) == ()
     assert not np.any(app['session']['current_rgb'])
     for item, labels in zip(prepared['review'].items, before):
         np.testing.assert_array_equal(item['labels'], labels)
@@ -542,7 +1475,7 @@ def test_review_gui_stroke_approval_navigation_and_project_resume(app, tmp_path,
     app['setup_review']()
     app['review_enabled_var'].set(True)
     app['review_tool_var'].set('positive')
-    app['review_cluster_combo'].current(0)
+    app['group_tree'].selection_set(()); _select_group_rows(app, 0)
     app['select_review_cluster']()
     app['refresh_preview_content']()
     canvas = app['preview_canvas']
@@ -566,7 +1499,7 @@ def test_review_gui_stroke_approval_navigation_and_project_resume(app, tmp_path,
     restored = app['session']['prepared']['review']
     assert restored.completed == {0}
     assert restored.selected_image == 1
-    app['review_cluster_combo'].current(0)
+    app['group_tree'].selection_set(()); _select_group_rows(app, 0)
     app['select_review_cluster']()
     app['reopen_review_cluster']()
     assert restored.completed == set()
@@ -597,6 +1530,7 @@ def test_joint_analysis_requires_active_reference_after_loading_old_project(app,
     app['open_project']()
     loaded = app['session']['prepared']
     assert loaded['review'].mode == 'independent'
+    app['analysis_mode_var'].set('Registradas (mesmo campo)')
     app['session']['_active_vars'][0].set(False)
     app['reference_var'].set(0)
     warnings = []
@@ -643,7 +1577,7 @@ def test_marking_and_navigation_only_accumulate_edits(app, tmp_path, monkeypatch
     assert app['session'].get('review_after') is None
     assert app['session'].get('autosave_after') is None
     monkeypatch.setattr(viewer, 'render_workspace', original_overlay)
-    app['review_cluster_combo'].current(1)
+    app['group_tree'].selection_set(()); _select_group_rows(app, 1)
     app['select_review_cluster']()
     app['review_image_combo'].current(1)
     app['select_review_image']()
@@ -662,19 +1596,19 @@ def test_gui_refines_named_groups_with_non_contiguous_ids_and_safe_regrouping(ap
     app['session']['prepared'] = prepared
     app['setup_review']()
     app['refresh_group_listboxes']()
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['merge_optical_selected']()
     state = prepared['review']
     assert state.groups == {0: {0, 1}, 2: {2}}
     app['apply_interpretation']('rename_cluster', 0, 'Matriz')
-    assert 'Matriz' in app['review_cluster_combo']['values'][0]
-    app['review_cluster_combo'].current(1)
+    assert 'Matriz' in _group_texts(app)[0]
+    app['group_tree'].selection_set(()); _select_group_rows(app, 1)
     app['select_review_cluster']()
     assert state.selected_cluster == 2
     state.annotate(0, 2, [212], 1)
     warnings = []
     monkeypatch.setattr(app['messagebox'], 'showinfo', lambda title, message: warnings.append(message))
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['merge_optical_selected']()
     assert warnings
     assert state.groups == {0: {0, 1}, 2: {2}}
@@ -720,12 +1654,12 @@ def test_guided_workspace_isolates_groups_without_separate_family_or_layer_panel
     app['setup_review']()
     app['refresh_group_listboxes']()
     app['go_to_step']('organize')
-    assert app['step_frames']['organize'].winfo_manager() == 'pack'
-    assert app['step_frames']['refine'].winfo_manager() == ''
+    assert app['step_frames']['interpretation'].winfo_manager() == 'pack'
+    assert app['step_frames']['preparation'].winfo_manager() == ''
     assert app['family_group_frame'].winfo_manager() == ''
     assert app['layers_panel'].winfo_manager() == ''
-    app['optical_group_list'].selection_clear(0, 'end')
-    app['optical_group_list'].selection_set(0, 1)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0, 1)
     app['on_group_selection']()
     app['review_display_var'].set('Máscara selecionada')
     app['change_preview']()
@@ -737,8 +1671,8 @@ def test_guided_workspace_isolates_groups_without_separate_family_or_layer_panel
     assert prepared['review'].selected_cluster == 0
     assert set(app['session']['_compare_sources']) == {'Imagem original', 'Classificação atual', 'Máscara selecionada'}
     app['go_to_step']('results')
-    assert app['step_frames']['results'].winfo_manager() == 'pack'
-    assert app['step_frames']['organize'].winfo_manager() == ''
+    assert app['step_frames']['interpretation'].winfo_manager() == 'pack'
+    assert app['step_frames']['preparation'].winfo_manager() == ''
 
 
 def test_workspace_resume_restores_step_image_and_mask_selection(app, tmp_path, monkeypatch):
@@ -749,8 +1683,8 @@ def test_workspace_resume_restores_step_image_and_mask_selection(app, tmp_path, 
     app['setup_review']()
     app['refresh_group_listboxes']()
     app['go_to_step']('organize')
-    app['optical_group_list'].selection_clear(0, 'end')
-    app['optical_group_list'].selection_set(1)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 1)
     app['on_group_selection']()
     app['review_image_combo'].current(1)
     app['select_review_image']()
@@ -762,10 +1696,10 @@ def test_workspace_resume_restores_step_image_and_mask_selection(app, tmp_path, 
     app['session']['prepared'] = None
     app['session']['workspace_selected_groups'] = []
     app['automatic_output_var'].set(True)
-    app['workflow_var'].set('images')
+    app['workflow_var'].set('preparation')
     app['review_display_var'].set('Imagem')
     app['open_project']()
-    assert app['workflow_var'].get() == 'organize'
+    assert app['workflow_var'].get() == 'interpretation'
     assert app['review_display_var'].get() == 'Máscara selecionada'
     assert app['session']['prepared']['review'].selected_image == 1
     assert app['session']['workspace_selected_groups'] == [1]
@@ -805,7 +1739,8 @@ def test_stage_navigation_preserves_pending_edits_without_training(app, tmp_path
     for step in ('organize', 'refine', 'results', 'organize'):
         app['go_to_step'](step)
         assert state.dirty == {0}
-        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [step]
+        expected = riima_gui._STEP_ALIASES.get(step, step)
+        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [expected]
     for item, initial in zip(state.items, before):
         np.testing.assert_array_equal(item['labels'], initial)
 
@@ -817,7 +1752,7 @@ def test_comparator_resume_restores_union_mask_and_presentation_settings(app, tm
     app['setup_review']()
     app['refresh_group_listboxes']()
     app['go_to_step']('organize')
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['on_group_selection']()
     app['review_opacity_var'].set(30)
     app['view_type_var'].set('compare')
@@ -846,17 +1781,18 @@ def test_deselecting_groups_clears_mask_and_refine_selection_follows_to_results(
     app['go_to_step']('organize')
     app['view_type_var'].set('layers')
     app['on_view_type_change']()
-    app['optical_group_list'].selection_clear(0, 'end')
+    app['group_tree'].selection_set(())
     app['on_group_selection']()
     app['review_display_var'].set('Máscara selecionada')
     app['change_preview']()
     assert app['session']['workspace_selected_groups'] == []
     assert not np.any(app['session']['current_rgb'])
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['on_group_selection']()
     app['go_to_step']('refine')
     app['go_to_step']('results')
-    assert app['selected_workspace_groups']() == [app['session']['prepared']['review'].selected_cluster]
+    assert app['selected_workspace_groups']() == [0, 1]
+    assert app['session']['prepared']['review'].selected_cluster == 0
 
 
 @pytest.mark.parametrize('failure', ['history', 'workspace', 'reserved_array', 'corrupt',
@@ -873,7 +1809,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
     app['setup_review']()
     app['refresh_group_listboxes']()
     app['go_to_step']('organize')
-    app['optical_group_list'].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app['on_group_selection']()
     app['review_opacity_var'].set(32)
     app['view_type_var'].set('compare')
@@ -935,7 +1871,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
     before_viewport = session['viewport']
     before_cache = session['compare_cache']
     before_active = [v.get() for v in session['_active_vars']]
-    before_selection = app['optical_group_list'].curselection()
+    before_selection = _group_row_indices(app)
     before_frames = {key: frame.winfo_manager() for key, frame in app['step_frames'].items()}
     def legend_text(widget):
         return [(child.cget('text') if 'text' in child.keys() else '', legend_text(child))
@@ -963,7 +1899,7 @@ def test_failed_project_open_preserves_session_and_visual_state(app, tmp_path, m
         np.testing.assert_array_equal(session['current_rgb'], before_rgb)
         assert {key: app[key].get() for key in controls} == before_controls
         assert [v.get() for v in session['_active_vars']] == before_active
-        assert app['optical_group_list'].curselection() == before_selection
+        assert _group_row_indices(app) == before_selection
         assert {key: frame.winfo_manager() for key, frame in app['step_frames'].items()} == before_frames
         assert legend_text(app['legend_rows']) == before_legend
         assert canvas_contents() == before_canvas
@@ -1012,7 +1948,7 @@ def test_failed_first_project_open_preserves_unanalyzed_images(app, tmp_path, mo
     assert session['images'] == before_images
     assert [v.get() for v in session['_active_vars']] == [False]
     assert session['current_rgb'] is None
-    assert app['workflow_var'].get() == 'images'
+    assert app['workflow_var'].get() == 'preparation'
     assert app['status_var'].get() == before_status
     assert [(canvas.type(i), canvas.coords(i), canvas.itemconfigure(i)) for i in canvas.find_all()] == before_canvas
 
@@ -1041,7 +1977,7 @@ def test_historical_project_open_restores_valid_workspace_without_changing_scien
     assert app['session']['project_path'] == str(path)
     assert app['session']['workspace_selected_groups'] == [1]
     assert app['session']['split_fraction'] == .25
-    assert app['workflow_var'].get() == 'organize'
+    assert app['workflow_var'].get() == 'interpretation'
     assert app['view_type_var'].get() == 'compare'
     assert app['review_opacity_var'].get() == 27.
     assert loaded['interpretation'].to_dict() == prepared['interpretation'].to_dict()
@@ -1106,6 +2042,8 @@ def analyzed_app(app, tmp_path_factory):
     paths = write_rgb_images(tmp_path, [ref, m1, m2])
 
     session = app["session"]
+    session['prepared'] = None
+    session['project_path'] = None
     session["images"] = [{"path": p, "name": Path(p).name} for p in paths]
     app["rebuild_image_rows"]()
     app["reference_var"].set(0)
@@ -1251,8 +2189,8 @@ def test_legend_comparator_names_original_and_current_classification(analyzed_ap
 def test_comparator_selected_mask_follows_current_image_and_selection(analyzed_app):
     app = analyzed_app
     app['go_to_step']('organize')
-    app['optical_group_list'].selection_clear(0, 'end')
-    app['optical_group_list'].selection_set(1)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 1)
     app['on_group_selection']()
     app['view_type_var'].set('compare')
     app['on_view_type_change']()
@@ -1404,11 +2342,12 @@ def test_sidebar_shows_only_active_step_and_preserves_viewport(analyzed_app):
     viewport = dataclasses.asdict(app['session']['viewport'])
     for step in ('classify', 'organize', 'refine', 'results'):
         app['go_to_step'](step)
-        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [step]
+        expected = riima_gui._STEP_ALIASES.get(step, step)
+        assert [key for key, frame in app['step_frames'].items() if frame.winfo_manager()] == [expected]
         assert dataclasses.asdict(app['session']['viewport']) == viewport
-    assert app['diagnostics_slot'].master is app['step_frames']['classify']
-    assert app['optical_group_frame'].master is app['step_frames']['organize']
-    assert app['review_frame'].master is app['step_frames']['refine']
+    assert app['diagnostics_slot'].master is app['step_frames']['preparation']
+    assert app['optical_group_frame'].master is app['step_frames']['interpretation']
+    assert app['review_frame'].master is app['step_frames']['interpretation']
 
 def test_diagnostics_block_is_compact_not_a_tall_bordered_section(app):
     """The diagnostics entry fits within the classification sidebar."""
@@ -1417,8 +2356,7 @@ def test_diagnostics_block_is_compact_not_a_tall_bordered_section(app):
     assert not isinstance(diagnostics_frame, ttk.Labelframe)
     children = diagnostics_frame.winfo_children()
     buttons = [w for w in children if isinstance(w, ttk.Button)]
-    assert len(buttons) == 1
-    assert buttons[0].cget("text") == "Diagnóstico de K..."
+    assert [button.cget('text') for button in buttons] == ['Diagnóstico de K...', 'Conferir máscara']
 
 
 def test_cluster_count_spinbox_and_diagnostic_share_the_same_k_range(app):
@@ -1444,7 +2382,7 @@ def test_cluster_count_spinbox_and_diagnostic_share_the_same_k_range(app):
 def test_header_contains_product_identity_and_project_actions(app):
     texts = _collect_label_texts(app['header'])
     assert texts[:2] == ['RIIMA', 'Really Intuitive Image Mapping by Affinity']
-    assert texts[2:] == ['Abrir projeto...', 'Salvar projeto']
+    assert texts[2:] == ['Abrir projeto...', 'Salvar projeto', 'Exportar']
 
 def test_manual_cluster_family_actions_preserve_raw_and_refresh_comparator(analyzed_app, monkeypatch):
     app = analyzed_app
@@ -1452,14 +2390,14 @@ def test_manual_cluster_family_actions_preserve_raw_and_refresh_comparator(analy
     raw = prepared["optical"]["labels"].copy()
     interpretation = prepared["interpretation"]
     monkeypatch.setattr(app["simpledialog"], "askstring", lambda *a, **kw: "Feldspato")
-    app["optical_group_list"].selection_clear(0, "end")
-    app["optical_group_list"].selection_set(0)
-    app["optical_group_list"].selection_set(2)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0)
+    _select_group_rows(app, 2)
     app["create_family_selected"]()
     assert interpretation.families[0]["clusters"] == [0, 2]
-    app['optical_group_list'].selection_clear(0, 'end')
-    app["optical_group_list"].selection_set(0)
-    app["optical_group_list"].selection_set(2)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 0)
+    _select_group_rows(app, 2)
     app["merge_optical_selected"]()
     assert {0, 2} in interpretation.groups
     assert np.array_equal(prepared["optical"]["labels"], raw)
@@ -1488,8 +2426,8 @@ def test_saved_association_metadata_preserved_without_an_extra_product(analyzed_
     app['apply_interpretation']('create_family', [0], 'A')
     app['go_to_step']('organize')
     app['family_group_list'].selection_set(0)
-    app['optical_group_list'].selection_clear(0, 'end')
-    app['optical_group_list'].selection_set(1)
+    app['group_tree'].selection_set(())
+    _select_group_rows(app, 1)
     app['change_family_membership']('add_to_family')
     assert interpretation.families[0]['clusters'] == [0, 1]
     app['family_group_list'].selection_set(0)
@@ -1516,15 +2454,15 @@ def test_gui_reports_cross_family_merge_without_changing_state(analyzed_app, mon
     before = interpretation.to_dict()
     messages = []
     monkeypatch.setattr(app["messagebox"], "showinfo", lambda title, text: messages.append(text))
-    app["optical_group_list"].selection_set(0, 1)
+    _select_group_rows(app, 0, 1)
     app["merge_optical_selected"]()
     assert interpretation.to_dict() == before
     assert "famílias diferentes" in messages[0]
     app["apply_interpretation"]("reset")
 
 
-@pytest.mark.parametrize('failure', ['second_image', 'review', 'publication'])
-def test_export_autosave_rolls_back_project_and_all_images(app, tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize('failure', ['second_image', 'review', 'metrics', 'publication'])
+def test_explicit_scientific_export_rolls_back_project_and_all_images(app, tmp_path, monkeypatch, failure):
     from test_riima_review import prepared_dataset
     from test_export_integrity import file_bytes, scientific_state
     from riima import exports
@@ -1533,7 +2471,7 @@ def test_export_autosave_rolls_back_project_and_all_images(app, tmp_path, monkey
     path = str(tmp_path / 'session.riima')
     session.update(prepared=prepared, project_path=path)
     app['setup_review']()
-    assert app['autosave_current']()
+    assert app['export_scientific_current']()
     before = file_bytes(tmp_path)
     prepared['interpretation'].rename_cluster(0, 'Changed')
     state = scientific_state(prepared)
@@ -1550,6 +2488,15 @@ def test_export_autosave_rolls_back_project_and_all_images(app, tmp_path, monkey
             patch.setattr(core, 'save_session_outputs', fail)
         elif failure == 'review':
             patch.setattr(review, 'save_review_outputs', lambda *args: (_ for _ in ()).throw(OSError('review failed')))
+        elif failure == 'metrics':
+            from riima import metrics
+            original = metrics._write_csv
+            def fail(path, *args, **kwargs):
+                if path.name == 'attribute_statistics.csv':
+                    path.write_text('incomplete sampled statistics', encoding='utf-8')
+                    raise OSError('metrics failed')
+                return original(path, *args, **kwargs)
+            patch.setattr(metrics, '_write_csv', fail)
         else:
             original = exports.os.replace
             def fail(source, target):
@@ -1557,36 +2504,70 @@ def test_export_autosave_rolls_back_project_and_all_images(app, tmp_path, monkey
                     raise OSError('publication failed')
                 return original(source, target)
             patch.setattr(exports.os, 'replace', fail)
-        assert app['autosave_current']() is False
+        assert app['export_scientific_current']() is False
     assert messages and session['project_path'] == path
     assert prepared['workspace'] is workspace
     assert scientific_state(prepared) == state
     assert file_bytes(tmp_path) == before
-    assert app['autosave_current']()
+    assert app['export_scientific_current']()
 
 
-def test_metadata_write_failure_keeps_previous_json_and_scientific_state(app, tmp_path, monkeypatch):
+def test_scientific_full_export_includes_all_metrics_files(app, tmp_path):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    app['session'].update(prepared=prepared, project_path=None)
+    app['setup_review']()
+    assert app['export_scientific_current']()
+    assert {path.name for path in (Path(prepared['output']) / 'metrics').glob('*')} == {
+        'group_summary.csv', 'regions.csv', 'attribute_statistics.csv',
+        'attribute_separation.csv', 'metrics_info.json'}
+
+
+@pytest.mark.parametrize('clean_sign, evidence', [(1, 'positive_conflicting'), (-1, 'negative_conflicting')])
+def test_review_status_reports_clean_support_and_conflicting_profile_abstention(app, tmp_path, clean_sign, evidence):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path)
+    state = prepared['review']
+    target = int(state.items[0]['initial'][8, 3])
+    state.selected_cluster = target
+    state.annotate(0, target, [8 * 24 + 3], 1)
+    state.annotate(0, target, [8 * 24 + 4], -1)
+    state.annotate(0, target, [8 * 24 + 20], clean_sign)
+    app['session']['prepared'] = prepared
+    app['setup_review']()
+    app['go_to_step']('refine')
+    app['refine_review_cluster']()
+    assert state.refinement_evidence[target] == evidence
+    text = app['status_var'].get()
+    assert 'Suporte óptico local aplicado' in text
+    assert 'contraditórios' in text and 'sem generalização' in text
+
+
+def test_project_write_failure_keeps_previous_archive_and_scientific_state(app, tmp_path, monkeypatch):
     from test_riima_review import prepared_dataset
     from test_export_integrity import fail_writes, scientific_state
     prepared = prepared_dataset(tmp_path)
     app['session'].update(prepared=prepared, project_path=None)
-    app['save_interpretation_metadata']()
-    target = Path(prepared['output']) / 'interpretation.json'
+    assert app['save_project_current']()
+    target = Path(prepared['output']) / 'projeto.riima'
     before = target.read_bytes()
     prepared['interpretation'].rename_cluster(0, 'Updated metadata')
     state = scientific_state(prepared)
+    errors = []
+    monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: errors.append(args))
     with monkeypatch.context() as patch:
-        fail_writes(patch, 'json')
+        fail_writes(patch, 'npy')
         patch.setattr(core, 'save_session_outputs', lambda *args: pytest.fail('full export'))
-        app['save_interpretation_metadata']()
+        assert app['save_project_current']() is False
     assert target.read_bytes() == before
+    assert errors
     assert scientific_state(prepared) == state
-    app['save_interpretation_metadata']()
+    assert app['save_project_current']()
     assert target.read_bytes() != before
 
 
 @pytest.mark.parametrize('failure', ['review', 'publication'])
-def test_analysis_autosave_failure_keeps_previous_scientific_files(app, tmp_path, monkeypatch, failure):
+def test_analysis_then_explicit_export_failure_keeps_previous_scientific_files(app, tmp_path, monkeypatch, failure):
     from test_riima_review import prepared_dataset
     from test_export_integrity import file_bytes
     prepared = prepared_dataset(tmp_path, count=1)
@@ -1595,7 +2576,7 @@ def test_analysis_autosave_failure_keeps_previous_scientific_files(app, tmp_path
     session.update(prepared=prepared, project_path=str(tmp_path / 'checkpoint.riima'),
                    images=[dict(path=path, name=Path(path).name)])
     app['setup_review']()
-    assert app['autosave_current']()
+    assert app['export_scientific_current']()
     before = file_bytes(Path(prepared['output']))
     app['out_var'].set(prepared['output'])
     app['clusters_var'].set(3)
@@ -1616,11 +2597,15 @@ def test_analysis_autosave_failure_keeps_previous_scientific_files(app, tmp_path
             return original(source, target)
         monkeypatch.setattr(exports.os, 'replace', fail)
     app['analyze']()
-    assert messages
+    assert not messages  # Quiet analysis does not attempt either scientific export.
     assert session['prepared'] is not prepared
     assert session['prepared']['config'].clusters == 3
-    assert file_bytes(Path(prepared['output'])) == before
-    assert 'pendente' in app['status_var'].get().lower()
+    after_analysis = file_bytes(Path(prepared['output']))
+    assert all(after_analysis[name] == value for name, value in before.items())
+    assert app['export_scientific_current']() is False
+    assert messages
+    assert file_bytes(Path(prepared['output'])) == after_analysis
+    assert 'exportação científica falhou' in app['status_var'].get().lower()
 
 
 def test_choose_output_changes_the_loaded_export_destination(app, tmp_path, monkeypatch):
@@ -1670,7 +2655,7 @@ def test_resumed_readonly_destination_can_be_changed_or_cancelled_before_export(
     monkeypatch.setattr(app['messagebox'], 'showinfo', lambda *args: None)
     monkeypatch.setattr(app['messagebox'], 'showerror', lambda *args: pytest.fail(str(args)))
     monkeypatch.setattr(app['filedialog'], 'askdirectory', lambda **kw: '' if cancel else str(selected))
-    result = app['autosave_current']()
+    result = app['export_scientific_current']()
     if cancel:
         assert result is False
         assert loaded['output'] == initial
@@ -1804,10 +2789,10 @@ def test_native_listbox_combobox_and_table_follow_desktop_tokens(app):
     from riima import theme
     root, style = app['root'], app['style']
     listbox = app['optical_group_list']
-    assert listbox.cget('background').lower() == theme.BG_PANEL.lower()
-    assert listbox.cget('foreground').lower() == theme.TEXT_PRIMARY.lower()
-    assert listbox.cget('selectbackground').lower() == theme.ACCENT.lower()
-    assert listbox.cget('selectforeground').lower() == theme.TEXT_ON_ACCENT.lower()
+    assert listbox.winfo_class() == 'Treeview'
+    assert style.lookup('Treeview', 'background').lower() == theme.BG_PANEL.lower()
+    assert style.lookup('Treeview', 'foreground').lower() == theme.TEXT_PRIMARY.lower()
+    assert style.lookup('Treeview', 'foreground', ('selected',)).lower() == theme.TEXT_ON_ACCENT.lower()
     assert style.lookup('TCombobox', 'fieldbackground', ('readonly',)).lower() == theme.BG_PANEL.lower()
     assert style.lookup('TCombobox', 'foreground', ('readonly',)).lower() == theme.TEXT_PRIMARY.lower()
     assert style.lookup('Treeview', 'fieldbackground').lower() == theme.BG_PANEL.lower()

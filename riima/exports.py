@@ -325,8 +325,12 @@ class _Export:
 
 
 @contextmanager
-def export_batch():
-    """Join nested exports, publishing their files together at the outer boundary."""
+def export_batch(*, publish=None):
+    """Join exports and optionally dispatch outer publication through a caller.
+
+    ``publish`` must synchronously run the supplied zero-argument callable for
+    complete publication, including rollback. Nested batches join the active operation.
+    """
     active = _current.get()
     if active is not None:
         try:
@@ -345,7 +349,24 @@ def export_batch():
         except BaseException:
             operation.abort()
             raise
-        operation.publish()
+        if publish is None:
+            operation.publish()
+        else:
+            started = False
+
+            def complete():
+                nonlocal started
+                started = True
+                operation.publish()
+
+            try:
+                publish(complete)
+                if not started:
+                    raise RuntimeError('A publicação da exportação não foi executada.')
+            except BaseException:
+                if not started:
+                    operation.abort()
+                raise
     finally:
         _current.reset(token)
 

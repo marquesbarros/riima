@@ -8,8 +8,11 @@ and ``riima.viewer`` for presentation/navigation.
 from __future__ import annotations
 
 import argparse
-import json
+from contextvars import copy_context
+import gc
+from queue import Empty, Queue
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -33,8 +36,9 @@ _MASK_MODE_LABELS = {
 # petrographic validation.
 _MASK_COVERAGE_WARN_RATIO = 0.70
 
-_WORKFLOW_STEPS = [('images', 'Imagens'), ('classify', 'Classificação'), ('organize', 'Seleção e Agrupamento'),
-                   ('refine', 'Revisão'), ('results', 'Resultados')]
+_WORKFLOW_STEPS = [('preparation', 'Preparação'), ('interpretation', 'Interpretação')]
+_STEP_ALIASES = dict(images='preparation', classify='preparation', organize='interpretation',
+                     refine='interpretation', results='interpretation')
 
 
 def gui(_test_hook=None) -> None:
@@ -83,6 +87,68 @@ def gui(_test_hook=None) -> None:
 
     style = ttk.Style(root)
     theme.apply(root, style)
+    icon_cache, tooltips = {}, {}
+    similarity_windows = set()
+
+    def desktop_icon(name, selected=False):
+        key = (name, selected)
+        if key not in icon_cache:
+            image = theme.icon_image(name, color=theme.TEXT_ON_ACCENT if selected else theme.TEXT_PRIMARY)
+            icon_cache[key] = ImageTk.PhotoImage(image, master=root)
+        return icon_cache[key]
+
+    def attach_tooltip(widget, text):
+        tip = dict(text=text, popup=None, after=None)
+        tooltips[widget] = tip
+        def hide(_event=None):
+            if tip['after'] is not None:
+                root.after_cancel(tip['after'])
+                tip['after'] = None
+            if tip['popup'] is not None:
+                if tip['popup'].winfo_exists():
+                    tip['popup'].destroy()
+                tip['popup'] = None
+        def show(_event=None):
+            hide()
+            if not widget.winfo_exists():
+                return
+            popup = tk.Toplevel(root)
+            popup.overrideredirect(True)
+            popup.attributes('-topmost', True)
+            popup.geometry(f'+{widget.winfo_rootx()}+{widget.winfo_rooty() + widget.winfo_height() + 4}')
+            tk.Label(popup, text=tip['text']() if callable(tip['text']) else tip['text'], justify='left', wraplength=330, padx=8, pady=6,
+                     font=theme.FONT_META, background=theme.BG_PANEL, foreground=theme.TEXT_PRIMARY,
+                     relief='solid', borderwidth=1).pack()
+            tip['popup'] = popup
+        def schedule(_event=None):
+            hide()
+            tip['after'] = root.after(450, show)
+        widget.bind('<Enter>', schedule, add='+')
+        for event in ('<Leave>', '<FocusOut>', '<ButtonPress>', '<Escape>'):
+            widget.bind(event, hide, add='+')
+        def destroy(event):
+            if event.widget is widget:
+                hide()
+                tooltips.pop(widget, None)
+        widget.bind('<Destroy>', destroy, add='+')
+        widget.bind('<FocusIn>', show, add='+')
+        widget.bind('<F1>', show, add='+')
+        return widget
+
+    def action_button(parent, text, command, *, icon=None, description='', **options):
+        options.setdefault('width', 0)
+        if icon is not None:
+            options['image'] = desktop_icon(icon)
+            options.setdefault('compound', 'left')
+            if options['compound'] == 'image':
+                options.setdefault('style', 'Icon.TButton')
+        button = ttk.Button(parent, text=text, command=command, takefocus=True, **options)
+        return attach_tooltip(button, text + ((' — ' if text else '') + description if description else ''))
+
+    def context_help(parent, text):
+        button = action_button(parent, 'Ajuda', lambda: None, icon='help', description=text)
+        button.config(command=lambda: button.event_generate('<F1>'))
+        return button
 
     out_var = tk.StringVar()
     automatic_output_var = tk.BooleanVar(value=True)
@@ -100,7 +166,9 @@ def gui(_test_hook=None) -> None:
     review_image_var = tk.StringVar()
     review_cluster_var = tk.StringVar()
     review_display_var = tk.StringVar(value="Sobreposição")
-    workflow_var = tk.StringVar(value='images')
+    workflow_var = tk.StringVar(value='preparation')
+    analysis_mode_var = tk.StringVar(value='Registradas (mesmo campo)')
+    active_group_var = tk.StringVar(value='Grupo ativo: —')
     workflow_hint_var = tk.StringVar()
     isolate_var = tk.BooleanVar(value=False)
     contours_var = tk.BooleanVar(value=False)
@@ -112,7 +180,8 @@ def gui(_test_hook=None) -> None:
     review_tool_buttons, view_mode_buttons = {}, {}
     def refresh_active_tool_buttons(*_args):
         for tool, button in review_tool_buttons.items():
-            button.config(style='Selected.TButton' if tool == review_tool_var.get() else 'TButton')
+            selected = tool == review_tool_var.get()
+            button.config(style='Selected.Icon.TButton' if selected else 'Icon.TButton', image=desktop_icon(tool, selected))
     review_tool_var.trace_add('write', refresh_active_tool_buttons)
     reference_buttons = {}
 
@@ -145,25 +214,145 @@ def gui(_test_hook=None) -> None:
         "layer_opacity_after": None,
         "analysis_seconds": None,
         "project_path": None,
+        "project_dirty": False,
         "review_after": None,
         "stroke_last": None,
         "workspace_selected_groups": [],
+        "busy": False,
+        "brush_position": None,
+        "science_revision": 0,
+        "similarity_cache": None,
+        "similarity_rows": [],
+        "group_selection_history": [],
+        "operation_after": None,
+        "operation_frame": 0,
     }
     retained_legend_rows = ()
+    ui_thread = threading.get_ident()
+    operation_messages = Queue()
+    operation_done = tk.BooleanVar(root, False)
 
     def set_status(text: str):
+        if threading.get_ident() != ui_thread:
+            operation_messages.put(('status', text))
+            return
         status_var.set(text)
         root.update_idletasks()
+
+    def run_operation(message, function, *args, **kwargs):
+        """Run one computation while Tk dispatches events with editing disabled.
+
+        Copy the caller's context so nested export operations retain their outer
+        transaction. Only the UI thread accesses widgets, including status updates.
+        """
+        if session['busy']:
+            raise RuntimeError('Aguarde o processamento atual terminar.')
+        session['busy'] = True
+        preview_canvas.delete('brush_cursor')
+        previous_cursor = preview_canvas.cget('cursor')
+        preview_canvas.config(cursor='watch')
+        controls = []
+
+        def disable(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, (ttk.Button, ttk.Menubutton, ttk.Entry, ttk.Combobox, ttk.Spinbox,
+                                      ttk.Checkbutton, ttk.Radiobutton, ttk.Scale, ttk.Treeview)):
+                    controls.append((child, child.state()))
+                    child.state(['disabled'])
+                elif isinstance(child, tk.Listbox):
+                    controls.append((child, child.cget('state')))
+                    child.config(state='disabled')
+                disable(child)
+
+        disable(root)
+        set_status(message)
+        start_operation_indicator()
+        root.update_idletasks()
+        operation_done.set(False)
+        result = []
+        context = copy_context()
+
+        def work():
+            try:
+                operation_messages.put(('result', context.run(function, *args, **kwargs)))
+            except BaseException as exc:
+                operation_messages.put(('error', exc))
+
+        def poll():
+            try:
+                while True:
+                    kind, value = operation_messages.get_nowait()
+                    if kind == 'status':
+                        status_var.set(value)
+                    else:
+                        result.append((kind, value))
+                        operation_done.set(True)
+                        return
+            except Empty:
+                root.after(15, poll)
+
+        # Tk variables can belong to unreachable cycles; finalize those on their
+        # owning thread rather than during an allocation in the worker.
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.collect()
+            gc.disable()
+        try:
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            root.after(15, poll)
+            root.wait_variable(operation_done)
+            worker.join()
+        finally:
+            poll = None
+            if gc_was_enabled:
+                gc.collect()
+                gc.enable()
+            stop_operation_indicator()
+            for widget, state in controls:
+                if widget.winfo_exists():
+                    if isinstance(widget, tk.Listbox):
+                        widget.config(state=state)
+                    else:
+                        widget.state(['!' + flag for flag in widget.state()])
+                        widget.state(state)
+            session['busy'] = False
+            preview_canvas.config(cursor=previous_cursor)
+            update_brush_outline()
+            refresh_export_actions()
+        kind, value = result[0]
+        if kind == 'error':
+            status_var.set('Não foi possível concluir o processamento.')
+            raise value
+        return value
 
     def selected_workspace_groups():
         prepared = session.get('prepared')
         if prepared is None or 'review' not in prepared:
             return []
         state = prepared['review']
-        if workflow_var.get() == 'refine':
-            return [state.selected_cluster]
         chosen = [c for c in session['workspace_selected_groups'] if c in state.groups]
         return chosen
+
+    def close_similarity_windows():
+        for window in tuple(similarity_windows):
+            if window.winfo_exists():
+                window.destroy()
+            similarity_windows.discard(window)
+
+    def refresh_similarity_windows(*, selection_only=False):
+        for window in tuple(similarity_windows):
+            if window.winfo_exists():
+                callback = getattr(window, '_sync_selection' if selection_only else '_refresh', None)
+                if callback is not None:
+                    callback()
+
+    def invalidate_similarity():
+        close_similarity_windows()
+        session['science_revision'] += 1
+        session['similarity_cache'] = None
+        session['similarity_rows'] = []
+        session['project_dirty'] = True
 
     def workspace_settings():
         return dict(step=workflow_var.get(), display=review_display_var.get(),
@@ -180,21 +369,23 @@ def gui(_test_hook=None) -> None:
             prepared['workspace'] = workspace_settings()
 
     def go_to_step(step):
+        if session['busy']:
+            return
+        step = _STEP_ALIASES.get(step, step)
         if step not in dict(_WORKFLOW_STEPS):
             return
-        if step in ('organize', 'refine', 'results') and session.get('prepared') is None:
+        if step == 'interpretation' and session.get('prepared') is None:
             return
         workflow_var.set(step)
-        review_enabled_var.set(step == 'refine')
+        review_enabled_var.set(step == 'interpretation')
         review_tool_var.set('pan')
-        if step == 'refine':
-            isolate_var.set(True)
-            review_display_var.set('Sobreposição')
-            session['workspace_selected_groups'] = [session['prepared']['review'].selected_cluster]
+        if step == 'interpretation':
             refresh_group_listboxes()
         session['compare_cache'] = None
         rebuild_compare_sources()
         change_preview()
+
+        refresh_similarity_windows(selection_only=True)
 
     def advance_step():
         keys = [key for key, _ in _WORKFLOW_STEPS]
@@ -209,26 +400,40 @@ def gui(_test_hook=None) -> None:
             go_to_step(keys[index - 1])
 
     def on_group_selection(_event=None):
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None:
             return
         state = prepared['review']
-        raw_members = set().union(*(prepared['interpretation'].groups[i]
-                                    for i in optical_group_list.curselection()))
-        chosen = [c for c in state.class_ids if state.groups[c] <= raw_members]
+        chosen = [int(value) for value in group_tree.selection() if int(value) in state.groups]
         session['workspace_selected_groups'] = chosen
-        if chosen:
-            state.selected_cluster = chosen[0]
         isolate_var.set(True)
         refresh_review_controls()
         session['compare_cache'] = None
         rebuild_compare_sources()
         change_preview()
+        refresh_similarity_windows(selection_only=True)
 
     def select_list_item(event):
         """A plain click replaces the selection; Shift toggles one additional item."""
         listbox = event.widget
-        if not listbox.size():
+        if isinstance(listbox, ttk.Treeview):
+            if session['busy'] or listbox.instate(['disabled']):
+                return 'break'
+            row = listbox.identify_row(event.y)
+            if row:
+                chosen = list(listbox.selection()) if event.state & (1 | 4) else []
+                if row in chosen:
+                    chosen.remove(row)
+                else:
+                    chosen.append(row)
+                listbox.selection_set(chosen)
+                listbox.focus(row)
+                listbox.focus_set()
+                on_group_selection()
+            return 'break'
+        if session['busy'] or str(listbox.cget('state')) == 'disabled' or not listbox.size():
             return 'break'
         index = listbox.nearest(event.y)
         selected = index in listbox.curselection()
@@ -253,27 +458,8 @@ def gui(_test_hook=None) -> None:
         )
         if not paths:
             return
-        # Finish saving before replacing any input or review state.
-        if session.get('prepared') is not None and not save_project_current():
-            return
-        for timer in ('review_after', 'autosave_after', 'layer_opacity_after'):
-            if session.get(timer) is not None:
-                root.after_cancel(session[timer])
-                session[timer] = None
-        session['prepared'] = None
-        session['project_path'] = None
-        session['compare_mode'] = False
-        session['compare_cache'] = None
-        session['viewport'] = None
-        session['workspace_selected_groups'] = []
-        review_image_combo['values'] = []
-        review_cluster_combo['values'] = []
-        review_image_var.set('')
-        review_cluster_var.set('')
-        optical_group_list.delete(0, tk.END)
-        family_group_list.delete(0, tk.END)
-        view_type_var.set('layers')
-        summary_var.set('')
+        # Stage inputs independently; the existing interpretation remains usable
+        # until a confirmed replacement has completed successfully.
         session["images"] = [{"path": p, "name": Path(p).name} for p in paths]
         session["registration_status"] = {}
         reference_var.set(0)
@@ -286,8 +472,7 @@ def gui(_test_hook=None) -> None:
                 suffix += 1
             out_var.set(str(directory))
         rebuild_image_rows()
-        rebuild_layers(reset=True)
-        go_to_step('images')
+        go_to_step('preparation')
         status_var.set(
             f"{len(paths)} imagem(ns) selecionada(s) para nova análise. Marque as ativas e a referência, depois clique em Gerar classificação."
         )
@@ -305,7 +490,7 @@ def gui(_test_hook=None) -> None:
                 for name in prepared['optical']['image_names']:
                     ttk.Label(images_list_frame, text=name).pack(anchor='w')
                 ttk.Label(images_list_frame, text='Imagens incluídas no projeto. Para refazer a análise, selecione os arquivos originais.',
-                          wraplength=260, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=5)
+                          wraplength=216, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=5)
             else:
                 ttk.Label(images_list_frame, text="Nenhuma imagem selecionada.", foreground=theme.TEXT_SECONDARY).pack(anchor="w")
             return
@@ -434,20 +619,12 @@ def gui(_test_hook=None) -> None:
         saved = prepared.get('workspace', {})
         session['workspace_selected_groups'] = [c for c in saved.get('selected_groups', [state.selected_cluster])
                                                  if c in state.groups]
+        refresh_group_listboxes()
         refresh_review_controls()
 
     def review_group_label(group):
         prepared = session.get('prepared')
-        state = prepared['review']
-        members = state.groups[group]
-        source = '+'.join(str(c) for c in sorted(members))
-        label = f'Cluster {group}' if len(members) == 1 else f'Grupo {source}'
-        interpretation = prepared['interpretation']
-        for i, existing in enumerate(interpretation.groups):
-            if existing == members:
-                name = interpretation.names.get(i)
-                return f'{name} ({label})' if name else label
-        return label
+        return prepared['review'].group_name(group, prepared['interpretation'])
 
     def sync_review_groups(*, topology=True):
         prepared = session.get('prepared')
@@ -457,21 +634,37 @@ def gui(_test_hook=None) -> None:
         interpretation = prepared['interpretation']
         if topology:
             state.sync_groups(interpretation.groups)
+            invalidate_similarity()
+        if state._catalog_edited:
+            return  # Current catalog colors are independent of raw provenance.
         palette = core.cluster_palette(len(interpretation.groups))
         for i, group in enumerate(interpretation.groups):
             if state.groups.get(min(group)) == group:
                 state.palette[min(group)] = interpretation.colors.get(i, palette[i])
 
     def refresh_review_controls():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None or 'review' not in prepared:
             return
         state = prepared['review']
         session['review_group_ids'] = state.class_ids
-        review_cluster_combo['values'] = [
-            f"{review_group_label(c)} ({'fundo' if c in state.background_groups else 'pronto' if c in state.completed else 'em revisão'})"
-            for c in state.class_ids]
-        review_cluster_combo.current(state.class_ids.index(state.selected_cluster))
+        from tkinter import font as tkfont
+        name = review_group_label(state.selected_cluster)
+        display_name = name
+        label_font = tkfont.Font(root=root, font=theme.font('body', bold=True))
+        if label_font.measure(name) > 216:
+            low, high = 0, len(name)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if label_font.measure(name[:middle] + '…') <= 216:
+                    low = middle
+                else:
+                    high = middle - 1
+            display_name = name[:low]
+        active_group_var.set(f'Ativo · ID {state.selected_cluster}\n' +
+                             (display_name + '…' if display_name != name else name))
         done = state.selected_cluster in state.completed
         background = state.selected_cluster in state.background_groups
         review_approve_btn.config(state='disabled' if done or background or state.has_pending else 'normal')
@@ -479,32 +672,50 @@ def gui(_test_hook=None) -> None:
         review_update_btn.config(state='normal' if state.has_pending else 'disabled')
         review_undo_btn.config(state='normal' if state.can_undo else 'disabled')
         review_reset_btn.config(state='disabled' if done else 'normal')
+        group_undo_btn.config(state='normal' if state.can_undo_group else 'disabled')
+        selected = selected_workspace_groups()
+        one = len(selected) == 1
+        for key in ('rename', 'color'):
+            group_action_buttons[key].config(state='normal' if one else 'disabled')
+        group_action_buttons['create'].config(state='normal')
+        group_action_buttons['merge'].config(state='normal' if len(selected) >= 2 and
+                                              not any(c in state.completed or c in state.background_groups for c in selected) else 'disabled')
+        deletable = one and len(state.groups) > 1 and selected[0] not in state.completed and selected[0] not in state.background_groups
+        group_action_buttons['delete'].config(state='normal' if deletable else 'disabled')
+        activate_group_btn.config(state='normal' if selected else 'disabled')
         for tool, button in review_tool_buttons.items():
             button.config(state='disabled' if (done or background) and tool in ('positive', 'negative', 'erase') else 'normal',
-                          style='Selected.TButton' if tool == review_tool_var.get() else 'TButton')
+                          style='Selected.Icon.TButton' if tool == review_tool_var.get() else 'Icon.TButton')
         counts = [int((item['annotations'].get(state.selected_cluster, np.zeros(0)) == value).sum())
                   for value in (1, -1) for item in state.items]
         n = len(state.items)
         review_status_var.set(
-            f'{len(state.completed)} grupos prontos, {len(state.background_groups)} de fundo. Seleção: {state.counts(state.selected_cluster)} pixels.\n'
-            f'Marcações: {sum(counts[:n])} manter, {sum(counts[n:])} remover.'
-            + ('\nEdições pendentes: clique em Atualizar classificação.' if state.has_pending else ''))
+            f'{state.counts(state.selected_cluster)} px · {len(state.completed)} prontos · {len(state.background_groups)} fundo\n'
+            f'Marcas: +{sum(counts[:n])} / −{sum(counts[n:])}'
+            + (' · pendentes' if state.has_pending else ''))
 
     def clear_group_selection():
-        optical_group_list.selection_clear(0, tk.END)
+        if session['busy']:
+            return
+        group_tree.selection_set(())
         family_group_list.selection_clear(0, tk.END)
         on_group_selection()
 
     def undo_review_stroke():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None or not prepared['review'].undo():
             return
+        invalidate_similarity()
         refresh_review_controls()
         refresh_group_listboxes()
         refresh_preview_content()
         status_var.set('Última pincelada desfeita. Atualize a classificação se houver edições pendentes.')
 
     def selected_groups_background(value):
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         chosen = selected_workspace_groups()
         if prepared is None or not chosen:
@@ -512,6 +723,7 @@ def gui(_test_hook=None) -> None:
             return
         try:
             prepared['review'].set_background(chosen, value)
+            invalidate_similarity()
         except ValueError as exc:
             messagebox.showinfo('Fundo da análise', str(exc))
             return
@@ -522,11 +734,14 @@ def gui(_test_hook=None) -> None:
                        'Seleção restaurada. Clique em Atualizar classificação na Revisão.')
 
     def reset_review_group():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None:
             return
         try:
             prepared['review'].reset_group(prepared['review'].selected_cluster)
+            invalidate_similarity()
         except ValueError as exc:
             messagebox.showinfo('Resetar grupo', str(exc))
             return
@@ -536,6 +751,8 @@ def gui(_test_hook=None) -> None:
         status_var.set('Marcações do grupo limpas. Clique em Atualizar classificação para reiniciar seu aprendizado.')
 
     def select_review_image(_event=None):
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None or review_image_combo.current() < 0:
             return
@@ -546,23 +763,129 @@ def gui(_test_hook=None) -> None:
         refresh_preview_content()
 
     def select_review_cluster(_event=None):
-        prepared = session.get('prepared')
-        if prepared is None or review_cluster_combo.current() < 0:
+        if session['busy']:
             return
-        cluster = session['review_group_ids'][review_cluster_combo.current()]
+        prepared = session.get('prepared')
+        chosen = [int(iid) for iid in group_tree.selection()]
+        if prepared is None or not chosen:
+            return
+        cluster = chosen[0]
+        session['workspace_selected_groups'] = chosen
         if session.get('review_after') is not None:
             root.after_cancel(session['review_after'])
             session['review_after'] = None
         prepared['review'].selected_cluster = cluster
-        session['workspace_selected_groups'] = [cluster]
-        isolate_var.set(True)
         refresh_group_listboxes()
         refresh_review_controls()
         session['compare_cache'] = None
         rebuild_compare_sources()
         refresh_preview_content()
 
+    def activate_selected_group(_event=None):
+        if _event is not None and getattr(_event, 'state', 0) & (1 | 4):
+            return select_list_item(_event)
+        select_review_cluster()
+        return 'break'
+
+    def select_groups(ids, *, add=False):
+        if session['busy'] or session.get('prepared') is None:
+            return
+        state = session['prepared']['review']
+        chosen = list(session['workspace_selected_groups']) if add else []
+        chosen = list(dict.fromkeys(chosen + [int(c) for c in ids if int(c) in state.groups]))
+        group_tree.selection_set([str(c) for c in chosen])
+        on_group_selection()
+
+    def group_edit(method, *args, presentation=False):
+        if session['busy'] or session.get('prepared') is None:
+            return None
+        state = session['prepared']['review']
+        previous = (list(session['workspace_selected_groups']), state.selected_cluster)
+        previous_snapshot = state._group_undo[-1] if state._group_undo else None
+        try:
+            function = getattr(state, method)
+            result = (function(*args) if presentation else
+                      run_operation('Atualizando os grupos...', function, *args))
+        except Exception as exc:
+            messagebox.showinfo('Gerenciar grupos', str(exc))
+            return None
+        if state._group_undo and state._group_undo[-1] is not previous_snapshot:
+            session['group_selection_history'].append(previous)
+        session['group_selection_history'] = session['group_selection_history'][-len(state._group_undo):] if state._group_undo else []
+        if method == 'create_group':
+            state.selected_cluster = result
+            session['workspace_selected_groups'] = [result]
+        elif method == 'merge_groups':
+            session['workspace_selected_groups'] = [result]
+        else:
+            session['workspace_selected_groups'] = [c for c in previous[0] if c in state.groups]
+        if presentation:
+            refresh_similarity_windows()
+        else:
+            invalidate_similarity()
+        session['project_dirty'] = True
+        refresh_group_listboxes()
+        refresh_review_controls()
+        session['compare_cache'] = None
+        rebuild_compare_sources()
+        change_preview()
+        return result
+
+    def create_group_current():
+        if session['busy'] or session.get('prepared') is None:
+            return
+        name = simpledialog.askstring('Criar grupo', 'Nome do novo grupo (opcional):', parent=root)
+        if name is not None:
+            group_edit('create_group', name)
+
+    def rename_group_current():
+        chosen = selected_workspace_groups()
+        if session['busy'] or len(chosen) != 1:
+            return
+        name = simpledialog.askstring('Renomear grupo', 'Nome interpretativo:',
+                                      initialvalue=review_group_label(chosen[0]), parent=root)
+        if name is not None:
+            group_edit('rename_group', chosen[0], name, presentation=True)
+
+    def recolor_group_current():
+        chosen = selected_workspace_groups()
+        if session['busy'] or len(chosen) != 1:
+            return
+        _, color = colorchooser.askcolor(parent=root, title='Cor do grupo')
+        if color is not None:
+            group_edit('recolor_group', chosen[0], tuple(int(color[i:i+2], 16) for i in (1, 3, 5)), presentation=True)
+
+    def merge_groups_current():
+        chosen = selected_workspace_groups()
+        if len(chosen) >= 2:
+            group_edit('merge_groups', chosen)
+
+    def delete_group_current():
+        chosen = selected_workspace_groups()
+        if len(chosen) == 1:
+            group_edit('delete_group', chosen[0])
+
+    def undo_group_current():
+        if session['busy'] or session.get('prepared') is None:
+            return
+        state = session['prepared']['review']
+        if not state.undo_group_operation():
+            return
+        selected, active = session['group_selection_history'].pop() if session['group_selection_history'] else ([], state.selected_cluster)
+        session['workspace_selected_groups'] = [c for c in selected if c in state.groups]
+        if active in state.groups:
+            state.selected_cluster = active
+        invalidate_similarity()
+        session['project_dirty'] = True
+        refresh_group_listboxes()
+        refresh_review_controls()
+        session['compare_cache'] = None
+        rebuild_compare_sources()
+        change_preview()
+
     def refine_review_cluster():
+        if session['busy']:
+            return
         if session.get('review_after') is not None:
             root.after_cancel(session['review_after'])
         session['review_after'] = None
@@ -573,7 +896,9 @@ def gui(_test_hook=None) -> None:
         review_update_btn.config(state='disabled')
         set_status('Aplicando as edições pendentes ao conjunto de imagens...')
         try:
-            trained = state.refine_pending(preferred=state.selected_cluster)
+            trained = run_operation('Atualizando a classificação...', state.refine_pending,
+                                    preferred=state.selected_cluster)
+            invalidate_similarity()
             show_applied_var.set(False)
             refresh_review_controls()
             refresh_group_listboxes()
@@ -581,14 +906,23 @@ def gui(_test_hook=None) -> None:
             rebuild_layers()
             rebuild_compare_sources()
             refresh_preview_content()
-            status_var.set('Classificação atualizada com todas as edições pendentes.' if any(trained.values()) else
-                           'Marcações aplicadas. Manter e Remover refinam os grupos no conjunto.')
+            evidence = getattr(state, 'refinement_evidence', {})
+            feedback = []
+            if any(trained.values()):
+                feedback.append('Modelo treinado; classificação atualizada.')
+            if any(value.startswith(('positive', 'negative')) for value in evidence.values()):
+                feedback.append('Suporte óptico local aplicado; um perfil único só permite coincidências exatas.')
+            if any('conflicting' in value for value in evidence.values()):
+                feedback.append('Perfis ópticos contraditórios: sem generalização nessas regiões.')
+            status_var.set(' '.join(feedback) if feedback else 'Edições aplicadas; classificação atualizada.')
         except Exception as exc:
             messagebox.showerror('Revisão do grupo', str(exc))
         finally:
             refresh_review_controls()
 
     def approve_review_cluster():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None:
             return
@@ -610,6 +944,8 @@ def gui(_test_hook=None) -> None:
         status_var.set('Grupo aprovado. Os pixels da seleção ficam protegidos.')
 
     def reopen_review_cluster():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if prepared is None:
             return
@@ -625,6 +961,8 @@ def gui(_test_hook=None) -> None:
         status_var.set('Grupo reaberto para revisão.')
 
     def save_project_current(*, choose=False):
+        if session['busy']:
+            return False
         prepared = session.get('prepared')
         if prepared is None:
             return False
@@ -637,8 +975,9 @@ def gui(_test_hook=None) -> None:
                 return False
         path = path or str(Path(prepared['output']) / 'projeto.riima')
         try:
-            review.save_project(prepared, path)
+            run_operation('Salvando o projeto...', review.save_project, prepared, path)
             session['project_path'] = path
+            session['project_dirty'] = False
             status_var.set(f'Projeto salvo: {path}')
             return True
         except Exception as exc:
@@ -647,27 +986,35 @@ def gui(_test_hook=None) -> None:
 
     def open_project():
         nonlocal session, retained_legend_rows
+        if session['busy']:
+            return
         path = filedialog.askopenfilename(filetypes=[('Projeto RIIMA', '*.riima'), ('Todos os arquivos', '*.*')])
         if not path:
             return
+        previous_status = status_var.get()
         try:
-            prepared = review.load_project(path)
+            prepared = run_operation('Carregando o projeto...', review.load_project, path)
             if session.get('prepared') is not None:
                 old = session['prepared']
                 old_path = session.get('project_path') or str(Path(old['output']) / 'projeto.riima')
-                review.save_project(dict(old, workspace=workspace_settings()), old_path)
+                run_operation('Salvando a sessão anterior...', review.save_project,
+                              dict(old, workspace=workspace_settings()), old_path)
                 if Path(path).resolve() == Path(old_path).resolve():
-                    prepared = review.load_project(path)
+                    prepared = run_operation('Carregando o projeto...', review.load_project, path)
         except Exception as exc:
+            status_var.set(previous_status)
             messagebox.showerror('Abrir projeto', str(exc))
             return
+        status_var.set(previous_status)
         previous = session
         controls = [(variable, variable.get()) for variable in project_view_variables]
         active = [variable.get() for variable in previous['_active_vars']]
         choices = [(combo, tuple(combo['values'])) for combo in
-                   (review_image_combo, review_cluster_combo, split_left_combo, split_right_combo)]
+                   (review_image_combo, split_left_combo, split_right_combo)]
         selections = [(box, box.get(0, tk.END), box.curselection())
-                      for box in (optical_group_list, family_group_list)]
+                      for box in (family_group_list,)]
+        group_entries = [(iid, group_tree.item(iid)) for iid in group_tree.get_children()]
+        group_selection = group_tree.selection()
         buttons = [(button, {key: button.cget(key) for key in ('state', 'style', 'text')})
                    for button in project_view_buttons]
         legend = [(child, child.pack_info()) for child in legend_rows.winfo_children()]
@@ -697,6 +1044,10 @@ def gui(_test_hook=None) -> None:
                     box.insert(tk.END, entry)
                 for index in selected:
                     box.selection_set(index)
+            group_tree.delete(*group_tree.get_children())
+            for iid, options in group_entries:
+                group_tree.insert('', 'end', iid=iid, **options)
+            group_tree.selection_set(group_selection)
             update_context_controls()
             clear_legend()
             for child, layout in legend:
@@ -724,11 +1075,14 @@ def gui(_test_hook=None) -> None:
 
     def show_loaded_project(prepared, path):
         session['prepared'] = prepared
+        session['group_selection_history'] = []
+        invalidate_similarity()
         session['project_path'] = path
         session['compare_cache'] = None
         session['viewport'] = None
         out_var.set(prepared['output'])
         clusters_var.set(prepared['config'].clusters)
+        analysis_mode_var.set('Independentes (campos distintos)' if prepared['review'].mode == 'independent' else 'Registradas (mesmo campo)')
         session['images'] = ([dict(path=item['path'], name=item['name']) for item in prepared['review'].items]
                              if prepared['review'].mode == 'independent' else [])
         if prepared['review'].mode == 'registered':
@@ -744,10 +1098,11 @@ def gui(_test_hook=None) -> None:
         refresh_group_listboxes()
         saved_workspace = prepared.get('workspace', {})
         automatic_output_var.set(bool(saved_workspace.get('automatic_output', True)))
-        workflow_var.set(saved_workspace.get('step', 'refine' if prepared['review'].completed or prepared['review'].has_pending else 'organize'))
+        restored_step = saved_workspace.get('step', 'refine' if prepared['review'].completed or prepared['review'].has_pending else 'organize')
+        workflow_var.set(_STEP_ALIASES.get(restored_step, restored_step))
         if workflow_var.get() not in dict(_WORKFLOW_STEPS):
-            workflow_var.set('organize')
-        review_enabled_var.set(workflow_var.get() == 'refine')
+            workflow_var.set('interpretation')
+        review_enabled_var.set(workflow_var.get() == 'interpretation')
         review_display_var.set(saved_workspace.get('display', 'Sobreposição'))
         isolate_var.set(bool(saved_workspace.get('isolate', True)))
         contours_var.set(bool(saved_workspace.get('contours', False)))
@@ -767,32 +1122,39 @@ def gui(_test_hook=None) -> None:
             compare_panel.pack_forget()
         change_preview()
         status_var.set('Projeto retomado com marcações, máscaras aprovadas e aprendizado preservados.')
+        session['project_dirty'] = False
 
     def close_app():
+        if session['busy']:
+            status_var.set('Aguarde o processamento terminar antes de fechar.')
+            return
         if session.get('prepared') is not None and not save_project_current():
             return
         root.destroy()
 
     def refresh_group_listboxes():
-        optical_group_list.delete(0, "end")
+        group_tree.delete(*group_tree.get_children())
         family_group_list.delete(0, "end")
         interpretation = current_interpretation()
         if interpretation is None:
             return
         state = session['prepared']['review']
         session['workspace_selected_groups'] = [c for c in session['workspace_selected_groups'] if c in state.groups]
-        for i, group in enumerate(interpretation.groups):
-            src = "+".join(str(v) for v in sorted(group))
-            base = f"Cluster {src}" if len(group) == 1 else f"Grupo {i} [clusters {src}]"
-            name = interpretation.names.get(i)
-            state = session['prepared']['review']
-            ids = [c for c in state.class_ids if state.groups[c] <= group]
-            status = ('fundo' if ids and all(c in state.background_groups for c in ids) else
-                      'pronto' if ids and all(c in state.completed for c in ids) else
-                      'edições pendentes' if any(c in state.dirty for c in ids) else 'em revisão')
-            optical_group_list.insert("end", f"{name or f'Grupo {min(group)}'} · {status}")
-            if any(c in session['workspace_selected_groups'] for c in ids):
-                optical_group_list.selection_set(i)
+        counts = {}
+        for item in state.items:
+            ids, areas = np.unique(item['labels'][item['display_valid']], return_counts=True)
+            for c, area in zip(ids, areas):
+                counts[int(c)] = counts.get(int(c), 0) + int(area)
+        photos = []
+        for c in state.class_ids:
+            photo = ImageTk.PhotoImage(Image.new('RGB', (12, 12), tuple(int(v) for v in state.palette[c])), master=root)
+            photos.append(photo)
+            status = ('protegido' if c in state.completed else 'fundo' if c in state.background_groups else
+                      'vazio' if not counts.get(c, 0) else 'pendente' if c in state.dirty else 'em revisão')
+            group_tree.insert('', 'end', iid=str(c), text=review_group_label(c), image=photo,
+                              values=(c, status), tags=('active',) if c == state.selected_cluster else ())
+        session['_group_swatches'] = photos
+        group_tree.selection_set([str(c) for c in session['workspace_selected_groups']])
         for i, family in enumerate(interpretation.families):
             src = "+".join(str(v) for v in sorted(family["clusters"]))
             name = family.get("name") or f"Família {i + 1}"
@@ -945,6 +1307,9 @@ def gui(_test_hook=None) -> None:
         preview_canvas.create_oval(hx - r, hy - r, hx + r, hy + r, fill=theme.BG_PANEL, outline=theme.ACCENT, width=2)
 
     def render_preview_canvas():
+        if session['busy']:
+            session['resize_after'] = root.after(100, render_preview_canvas)
+            return
         preview_canvas.delete("all")
         rgb = session.get("current_rgb")
         width = max(1, int(preview_canvas.winfo_width()))
@@ -952,7 +1317,7 @@ def gui(_test_hook=None) -> None:
         if rgb is None:
             preview_canvas.create_text(
                 width // 2, height // 2,
-                text="Selecione imagens e clique em Analisar.",
+                text="Selecione imagens e clique em Gerar classificação.",
                 fill=theme.TEXT_ON_CANVAS, font=theme.font('empty'),
             )
             return
@@ -978,6 +1343,32 @@ def gui(_test_hook=None) -> None:
         preview_canvas.create_image(ox, oy, image=session["photo"], anchor="nw")
         if session.get("compare_mode"):
             draw_divider_handle(session.get("split_fraction", 0.5), image_shape, viewport_size)
+        update_brush_outline()
+
+    def update_brush_outline(*_args):
+        position = session.get('brush_position')
+        viewport = session.get('viewport')
+        prepared = session.get('prepared')
+        if (position is None or viewport is None or prepared is None or 'review' not in prepared
+                or session['busy'] or not review_enabled_var.get() or review_tool_var.get() == 'pan'
+                or session.get('compare_mode')):
+            preview_canvas.delete('brush_cursor')
+            return
+        radius = review_radius_var.get() * viewport.zoom
+        x, y = position
+        box = (x - radius, y - radius, x + radius, y + radius)
+        circles = preview_canvas.find_withtag('brush_cursor')
+        if not circles:
+            for color, width in ((theme.BG_CANVAS, 3), (theme.TEXT_ON_CANVAS, 1)):
+                preview_canvas.create_oval(*box, outline=color, width=width, tags='brush_cursor')
+        else:
+            for circle in circles:
+                preview_canvas.coords(circle, *box)
+        preview_canvas.tag_raise('brush_cursor')
+
+    def on_canvas_leave(_event=None):
+        session['brush_position'] = None
+        preview_canvas.delete('brush_cursor')
 
     def draw_compare_frame(fraction):
         """Fast path used while actively dragging the divider: crops the two *cached*
@@ -1058,6 +1449,8 @@ def gui(_test_hook=None) -> None:
         return viewer.split_divider_geometry(state, shape, (width, height), session.get("split_fraction", 0.5))
 
     def on_canvas_press(event):
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         if (review_enabled_var.get() and review_tool_var.get() != 'pan'
                 and prepared is not None and 'review' in prepared and not session.get('compare_mode')
@@ -1081,6 +1474,9 @@ def gui(_test_hook=None) -> None:
         session["drag_last"] = (event.x, event.y)
 
     def on_canvas_drag(event):
+        if session['busy']:
+            return
+        session['brush_position'] = (event.x, event.y)
         shape = session.get("current_image_shape")
         if session.get("drag_mode") is None or shape is None:
             return
@@ -1100,6 +1496,8 @@ def gui(_test_hook=None) -> None:
             render_preview_canvas()
 
     def on_canvas_release(_event=None):
+        if session['busy']:
+            return
         if session.get('drag_mode') == 'annotate':
             session['prepared']['review'].end_stroke()
             session['stroke_last'] = None
@@ -1132,6 +1530,7 @@ def gui(_test_hook=None) -> None:
         except ValueError as exc:
             status_var.set(str(exc))
             return
+        invalidate_similarity()
         # Change only the affected RGB pixels; do not render/count the dataset per motion.
         item = state.items[image_id]
         allowed = item['valid'].ravel()[indices] & (item['locked'].ravel()[indices] < 0)
@@ -1145,7 +1544,12 @@ def gui(_test_hook=None) -> None:
         render_preview_canvas()
 
     def on_canvas_motion(event):
-        """Cursor feedback only: a double-headed arrow near the divider, a hand while panning."""
+        """Move native Canvas overlays without rebuilding the scientific raster."""
+        session['brush_position'] = (event.x, event.y)
+        update_brush_outline()
+        if session['busy']:
+            preview_canvas.config(cursor='watch')
+            return
         geo = _current_divider_geometry()
         if review_enabled_var.get() and review_tool_var.get() != 'pan' and not session.get('compare_mode'):
             preview_canvas.config(cursor='crosshair')
@@ -1228,6 +1632,9 @@ def gui(_test_hook=None) -> None:
         if session.get('layer_opacity_after') is not None:
             root.after_cancel(session['layer_opacity_after'])
         def redraw():
+            if session['busy']:
+                session['layer_opacity_after'] = root.after(100, redraw)
+                return
             session['layer_opacity_after'] = None
             change_preview()
         session['layer_opacity_after'] = root.after(80, redraw)
@@ -1235,13 +1642,12 @@ def gui(_test_hook=None) -> None:
 
 
     def update_context_controls():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         step = workflow_var.get()
-        hints = dict(images='Importe as imagens e escolha como elas serão analisadas.',
-                     classify='Gere os grupos automáticos. Depois organize o resultado.',
-                     organize='Selecione grupos para inspecionar suas máscaras, unir, nomear e escolher cores.',
-                     refine='Marque o que manter ou remover. Atualize ao terminar e aprove cada grupo.',
-                     results='Confira o progresso e exporte a classificação atual ou as máscaras selecionadas.')
+        hints = dict(preparation='Prepare imagens e gere a classificação.',
+                     interpretation='Selecione para inspecionar; ative um grupo para revisar.')
         workflow_hint_var.set(hints[step])
         for key, frame in step_frames.items():
             if key == step:
@@ -1251,7 +1657,7 @@ def gui(_test_hook=None) -> None:
         family_group_frame.pack_forget()
         if prepared is not None and prepared['interpretation'].families:
             legacy_masks_toggle.pack(fill='x', pady=(8, 0))
-            if step == 'organize' and legacy_masks_var.get():
+            if step == 'interpretation' and legacy_masks_var.get():
                 family_group_frame.pack(fill='x', pady=(8, 0))
         else:
             legacy_masks_toggle.pack_forget()
@@ -1269,20 +1675,18 @@ def gui(_test_hook=None) -> None:
         else:
             diagnostics_frame.pack_forget()
         for key, button in step_buttons.items():
-            available = key == 'images' or (key == 'classify' and bool(session['images'] or prepared)) or prepared is not None
+            available = key == 'preparation' or prepared is not None
             button.config(state='normal' if available else 'disabled',
                           style='Primary.TButton' if key == step else 'TButton')
-        index = [key for key, _ in _WORKFLOW_STEPS].index(step)
-        back_btn.config(state='disabled' if index == 0 else 'normal')
-        next_available = index < 4 and (bool(session['images']) if step == 'images' else prepared is not None)
-        next_btn.config(state='normal' if next_available else 'disabled', text='Próximo')
         if prepared is not None:
             state = prepared['review']
             results_status_var.set(f'{len(state.completed)} grupos prontos e {len(state.background_groups)} de fundo.\n'
                                    + ('Há edições pendentes de atualização.' if state.has_pending else 'Classificação atualizada.'))
+        refresh_export_actions()
 
     def change_preview():
         update_context_controls()
+        update_summary_text()
         refresh_preview_content(legend=True)
 
     def update_summary_text():
@@ -1290,6 +1694,38 @@ def gui(_test_hook=None) -> None:
             summary_var.set(viewer.human_analysis_summary(session["prepared"]))
 
     def autosave_current():
+        """Save the portable project; scientific products are explicit exports."""
+        session['autosave_after'] = None
+        if session.get('prepared') is None:
+            return False
+        if not prepare_output_destination():
+            return False
+        prepared = session['prepared']
+        previous_path = session.get('project_path')
+        previous_dirty = session['project_dirty']
+        missing = object()
+        workspace = prepared.get('workspace', missing)
+        try:
+            with export_batch(publish=lambda write: run_operation('Publicando o projeto...', write)):
+                if not save_project_current():
+                    raise OSError('Não foi possível salvar o projeto.')
+            status_var.set('Projeto salvo. Exporte os produtos desejados pelo menu superior.')
+            return True
+        except Exception as exc:
+            session['project_path'] = previous_path
+            session['project_dirty'] = previous_dirty
+            if workspace is missing:
+                prepared.pop('workspace', None)
+            else:
+                prepared['workspace'] = workspace
+            status_var.set('Salvamento do projeto pendente.')
+            messagebox.showerror('Salvar projeto', str(exc))
+            return False
+
+    def export_scientific_current():
+        """Explicit full scientific tree, published with its portable project."""
+        if session['busy']:
+            return False
         session["autosave_after"] = None
         if session.get("prepared") is None:
             return
@@ -1297,10 +1733,11 @@ def gui(_test_hook=None) -> None:
             return False
         prepared = session['prepared']
         previous_path = session.get('project_path')
+        previous_dirty = session['project_dirty']
         missing = object()
         previous_workspace = prepared.get('workspace', missing)
         try:
-            with export_batch():
+            with export_batch(publish=lambda write: run_operation('Publicando os resultados...', write)):
                 staged_directory(prepared['output'])
                 if 'review' in prepared and not save_project_current():
                     if previous_workspace is missing:
@@ -1312,45 +1749,47 @@ def gui(_test_hook=None) -> None:
                     for i, item in enumerate(prepared['review'].items):
                         interpretation = core.Interpretation(item['optical'])
                         interpretation._restore(prepared['interpretation'].to_dict())
-                        core.save_session_outputs(dict(prepared, optical=item['optical'], interpretation=interpretation,
-                                                       output=str(Path(prepared['output']) / 'initial' / f'image_{i:03d}')))
+                        run_operation('Salvando os resultados iniciais...', core.save_session_outputs,
+                                      dict(prepared, optical=item['optical'], interpretation=interpretation,
+                                           output=str(Path(prepared['output']) / 'initial' / f'image_{i:03d}')))
                 else:
-                    core.save_session_outputs(prepared)
+                    run_operation('Salvando os resultados iniciais...', core.save_session_outputs, prepared)
                 if 'review' in prepared:
-                    review.save_review_outputs(prepared)
-            status_var.set("Resultados atualizados automaticamente.")
+                    run_operation('Salvando os resultados da revisão...', review.save_review_outputs, prepared)
+                run_operation('Calculando e exportando as métricas...', metrics.export_metrics, prepared)
+            status_var.set("Exportação científica completa concluída.")
             return True
         except Exception as exc:
             session['project_path'] = previous_path
+            session['project_dirty'] = previous_dirty
             if previous_workspace is missing:
                 prepared.pop('workspace', None)
             else:
                 prepared['workspace'] = previous_workspace
-            status_var.set("A análise está pronta, mas o salvamento automático falhou.")
+            status_var.set("A análise está pronta, mas a exportação científica falhou.")
             messagebox.showerror("Salvar resultados", str(exc))
             return False
 
     def schedule_autosave():
+        """Keep organization changes in memory until explicit save or normal close."""
         if session.get("autosave_after") is not None:
             root.after_cancel(session["autosave_after"])
-        session["autosave_after"] = root.after(700, save_interpretation_metadata)
+        session['autosave_after'] = None
+        save_interpretation_metadata()
 
     def save_interpretation_metadata():
+        """Legacy callback: record unsaved interpretation without technical sidecars."""
         session['autosave_after'] = None
         prepared = session.get('prepared')
         if prepared is None:
             return
-        if not prepare_output_destination():
-            return False
-        try:
-            folder = Path(prepared['output'])
-            with export_batch():
-                staged_file(folder / 'interpretation.json').write_text(
-                    json.dumps(prepared['interpretation'].to_dict(), indent=2, ensure_ascii=False), encoding='utf-8')
-        except OSError as exc:
-            status_var.set(f'Salvamento de interpretação pendente: {exc}')
+        session['project_dirty'] = True
+        status_var.set('Alterações no projeto; use Salvar projeto para guardar o progresso.')
 
     def refresh_interpretation():
+        if session['busy']:
+            return
+        refresh_similarity_windows()
         refresh_review_controls()
         refresh_group_listboxes()
         update_summary_text()
@@ -1361,6 +1800,8 @@ def gui(_test_hook=None) -> None:
         schedule_autosave()
 
     def apply_interpretation(method, *args):
+        if session['busy']:
+            return
         interpretation = current_interpretation()
         if interpretation is None:
             return
@@ -1376,8 +1817,15 @@ def gui(_test_hook=None) -> None:
             return
         refresh_interpretation()
 
+    def legacy_selected_indices():
+        prepared = session.get('prepared')
+        if prepared is None:
+            return []
+        members = [prepared['review'].groups[int(c)] for c in group_tree.selection()]
+        return [i for i, group in enumerate(prepared['interpretation'].groups) if group in members]
+
     def merge_optical_selected():
-        selected = list(optical_group_list.curselection())
+        selected = legacy_selected_indices()
         if len(selected) < 2:
             messagebox.showinfo("Unir clusters", "Selecione pelo menos dois clusters.")
             return
@@ -1390,7 +1838,7 @@ def gui(_test_hook=None) -> None:
         apply_interpretation("reset_clusters")
 
     def create_family_selected():
-        selected = list(optical_group_list.curselection())
+        selected = legacy_selected_indices()
         if not selected:
             messagebox.showinfo("Criar família", "Selecione um ou mais clusters acima.")
             return
@@ -1399,17 +1847,18 @@ def gui(_test_hook=None) -> None:
             apply_interpretation("create_family", selected, name.strip())
 
     def select_legacy_mask():
+        if session['busy']:
+            return
         prepared = session.get('prepared')
         selected = family_group_list.curselection()
         if prepared is None or not selected:
             return
         members = set().union(*(set(prepared['interpretation'].families[i]['clusters']) for i in selected))
         state = prepared['review']
-        chosen = [c for c in state.class_ids if state.groups[c] <= members]
+        chosen = [c for c in state.class_ids if state.groups[c] and state.groups[c] <= members]
         if not chosen:
             return
         session['workspace_selected_groups'] = chosen
-        state.selected_cluster = chosen[0]
         review_display_var.set('Máscara selecionada')
         isolate_var.set(True)
         refresh_review_controls()
@@ -1420,7 +1869,7 @@ def gui(_test_hook=None) -> None:
 
     def change_family_membership(method):
         families = list(family_group_list.curselection())
-        clusters = list(optical_group_list.curselection())
+        clusters = legacy_selected_indices()
         if len(families) != 1 or not clusters:
             messagebox.showinfo("Família", "Selecione uma família e um ou mais clusters acima.")
             return
@@ -1441,7 +1890,7 @@ def gui(_test_hook=None) -> None:
         apply_interpretation("delete_family", selected[0])
 
     def rename_selected_group(listbox, kind):
-        selected = list(listbox.curselection())
+        selected = legacy_selected_indices() if listbox is group_tree else list(listbox.curselection())
         if len(selected) != 1:
             messagebox.showinfo("Renomear", "Selecione exatamente um item para renomear.")
             return
@@ -1453,7 +1902,7 @@ def gui(_test_hook=None) -> None:
             apply_interpretation(f"rename_{kind}", index, name.strip())
 
     def recolor_selected_group(listbox, kind):
-        selected = list(listbox.curselection())
+        selected = legacy_selected_indices() if listbox is group_tree else list(listbox.curselection())
         if len(selected) != 1:
             messagebox.showinfo("Cor", "Selecione exatamente um item para trocar a cor.")
             return
@@ -1617,7 +2066,19 @@ def gui(_test_hook=None) -> None:
         ttk.Button(btns, text="Fechar", command=win.destroy).pack(side="right")
 
         def run_evaluation():
-            result = core.evaluate_cluster_counts(sample_X, k_values, seed=13)
+            if session['busy']:
+                win.after(100, run_evaluation)
+                return
+            try:
+                result = run_operation('Avaliando os valores de K...', core.evaluate_cluster_counts,
+                                       sample_X, k_values, seed=13)
+            except Exception as exc:
+                if win.winfo_exists():
+                    status_lbl.config(text=str(exc))
+                return
+            status_var.set('Diagnóstico de K concluído.')
+            if not win.winfo_exists():
+                return
             validity = result.get("diagnostic_valid", [True] * len(result["k_values"]))
             suggested_k = core.recommend_cluster_count(
                 result["k_values"], result["silhouette"], diagnostic_valid=validity)
@@ -1645,131 +2106,121 @@ def gui(_test_hook=None) -> None:
         win.after(50, run_evaluation)  # let the window paint "Calculando…" before the (short) computation
 
     def analyze():
-        images = session.get("images", [])
+        if session['busy']:
+            return
+        images = session.get('images', [])
         if not images:
-            messagebox.showwarning("Entrada incompleta", "Selecione uma ou mais imagens.")
+            messagebox.showwarning('Entrada incompleta', 'Selecione uma ou mais imagens.')
             return
-        if not out_var.get():
-            out_var.set(str(Path(images[0]["path"]).parent / "riima_output"))
-        active_flags = [v.get() for v in session.get("_active_vars", [])]
+        flags = [v.get() for v in session.get('_active_vars', [])]
+        independent = analysis_mode_var.get().startswith('Independentes')
         try:
-            selected_paths, ref_idx = core.normalize_image_selection(
-                [im["path"] for im in images], active_flags, int(reference_var.get())
-            )
-        except ValueError as exc:
-            messagebox.showwarning("Seleção de imagens", str(exc))
+            if independent:
+                selected_paths = [item['path'] for i, item in enumerate(images) if not flags or flags[i]]
+                if not selected_paths:
+                    raise ValueError('Selecione ao menos uma imagem ativa.')
+                ref_idx = 0
+            else:
+                selected_paths, ref_idx = core.normalize_image_selection(
+                    [item['path'] for item in images], flags, int(reference_var.get()))
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showwarning('Seleção de imagens', str(exc))
             return
-        analyze_btn.config(state="disabled")
-        if session.get('prepared') is not None and not save_project_current():
-            analyze_btn.config(state='normal')
-            return
-        for timer in ('review_after', 'autosave_after'):
-            if session.get(timer) is not None:
-                root.after_cancel(session[timer])
-                session[timer] = None
-        start = time.perf_counter()
         try:
             optical_cfg = core.Config(clusters=int(clusters_var.get()))
-            mask_mode = _MASK_MODE_LABELS.get(mask_mode_var.get(), "auto")
-            saved = None
-            try:
-                with export_batch():
-                    prepared = core.prepare_analysis(
-                        selected_paths, out_var.get(), reference_index=ref_idx,
-                        optical_cfg=optical_cfg, stage_callback=set_status,
-                        mask_mode=mask_mode,
-                    )
-                    # Replace the workspace only after preparation succeeds. An invalid
-                    # input, unreadable file or registration failure keeps the last result.
-                    summary_var.set("")
-                    session["compare_mode"] = False
-                    session["compare_cache"] = None
-                    view_type_var.set("layers")
-                    compare_panel.pack_forget()
-                    layers_panel.pack_forget()
-                    session["viewport"] = None
-                    session["prepared"] = prepared
-                    session['project_path'] = str(Path(prepared['output']) / 'projeto.riima')
-                    review_enabled_var.set(False)
-                    review_display_var.set('Sobreposição')
-                    isolate_var.set(False)
-                    contours_var.set(False)
-                    review_tool_var.set('pan')
-                    setup_review()
-                    refresh_group_listboxes()
-
-                    status_map = {}
-                    for entry in prepared["optical"].get("registered_images", []):
-                        reg = entry.get("registration")
-                        if reg is None:
-                            status_map[entry['name']] = 'imagem incluída'
-                            continue
-                        status_map[entry["name"]] = (
-                            "referência" if reg.get("is_reference")
-                            else "Confira o alinhamento: coordenadas preservadas; registro não verificado."
-                            if reg.get('registration_warning')
-                            else core.registration_quality_label(reg["score_before"], reg["score_after"])
-                        )
-                    update_row_statuses(status_map)
-
-                    rebuild_layers(reset=True)
-                    rebuild_compare_sources()
-                    update_summary_text()
-                    saved = autosave_current()
-            except OSError as exc:
-                if saved is None:
-                    raise
-                if saved:
-                    messagebox.showerror("Salvar resultados", str(exc))
-                saved = False
-            session["analysis_seconds"] = time.perf_counter() - start
-            update_context_controls()
-            refresh_preview_content(legend=True)
-            overlap_note = ""
-            if prepared["optical"].get("overlap_status") == "warn":
-                overlap_note = " Atenção: sobreposição comum entre as imagens está baixa."
-            mask_note = ""
-            if mask_mode == "auto":
-                overlap_mask = prepared["optical"].get("overlap")
-                valid_mask = prepared["optical"].get("valid")
-                if overlap_mask is not None and valid_mask is not None and overlap_mask.mean() > 0:
-                    coverage = float(valid_mask.mean()) / float(overlap_mask.mean())
-                    if coverage < _MASK_COVERAGE_WARN_RATIO:
-                        mask_note = (
-                            " Atenção: a máscara automática excluiu uma fração grande da "
-                            "área registrada; compare a classificação com a imagem original e considere "
-                            "\"Somente sobreposição comum\" em Classificação."
-                        )
-            status_var.set(
-                (
-                    f"Análise concluída em {session['analysis_seconds']:.1f} s com {len(selected_paths)} imagem(ns)."
-                    f"{overlap_note}{mask_note} "
-                    + ("Resultados salvos automaticamente." if saved else "Salvamento pendente; use Salvar projeto.")
-                ).replace('.', ',')
-            )
-        except core.InsufficientOverlapError as exc:
-            if session.get('prepared') is None:
-                session["current_rgb"] = None
-                rebuild_layers(reset=True)
-                refresh_preview_content(legend=True)
-            status_var.set("Sobreposição insuficiente entre as imagens.")
-            messagebox.showerror("Sobreposição insuficiente", str(exc))
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror('Configuração da análise', str(exc))
+            return
+        if not out_var.get():
+            out_var.set(str(Path(selected_paths[0]).parent / 'riima_output'))
+        if session.get('prepared') is not None:
+            if not messagebox.askyesno('Substituir análise?',
+                    'Uma nova classificação substituirá os grupos e a revisão atuais. '
+                    'O projeto anterior será salvo e preservado em seu arquivo. Continuar?', parent=root):
+                return
+            if not save_project_current():
+                return
+        previous = dict(session)
+        previous_variables = [(variable, variable.get()) for variable in project_view_variables]
+        start_time = time.perf_counter()
+        mask_mode = _MASK_MODE_LABELS.get(mask_mode_var.get(), 'auto')
+        output = out_var.get()
+        analyze_btn.config(state='disabled')
+        def prepare_candidate():
+            if independent:
+                result = review.prepare_independent_analysis(selected_paths, output, optical_cfg,
+                    mask_mode=mask_mode, stage_callback=set_status)
+            else:
+                result = core.prepare_analysis(selected_paths, output, reference_index=ref_idx,
+                    optical_cfg=optical_cfg, mask_mode=mask_mode, stage_callback=set_status, publish_outputs=False)
+            if 'review' not in result:
+                result['review'] = review.ClusterReview.from_prepared(result)
+            return result
+        try:
+            prepared = run_operation('Preparando a nova análise...', prepare_candidate)
+            prepared['workspace'] = dict(workspace_settings(), selected_groups=[prepared['review'].selected_cluster],
+                                         display='Sobreposição', isolate=False, contours=False,
+                                         show_applied=False, view_type='layers')
+            target = Path(prepared['output']) / 'projeto.riima'
+            suffix = 2
+            while target.exists():
+                target = Path(prepared['output']) / f'projeto_{suffix}.riima'
+                suffix += 1
+            # Complete and publish the candidate archive before replacing the active
+            # scientific session. A failed preparation/write leaves the old result intact.
+            with export_batch(publish=lambda write: run_operation('Publicando o novo projeto...', write)):
+                run_operation('Salvando a nova análise...', review.save_project, prepared, str(target))
+            show_loaded_project(prepared, str(target))
+            session['images'] = previous['images']
+            rebuild_image_rows()
+            for variable, enabled in zip(session['_active_vars'], flags):
+                variable.set(enabled)
+            reference_var.set(int(next(value for variable, value in previous_variables if variable is reference_var)))
+            status_map = {}
+            for entry in prepared['optical'].get('registered_images', []):
+                reg = entry.get('registration')
+                status_map[entry['name']] = ('imagem incluída' if reg is None else 'referência' if reg.get('is_reference') else
+                    'Confira o alinhamento: coordenadas preservadas; registro não verificado.' if reg.get('registration_warning') else
+                    core.registration_quality_label(reg['score_before'], reg['score_after']))
+            update_row_statuses(status_map)
+            session['analysis_seconds'] = time.perf_counter() - start_time
+            note = ''
+            raw = prepared['optical']
+            if raw.get('overlap_status') == 'warn':
+                note += ' Atenção: sobreposição comum entre as imagens está baixa.'
+            overlap, valid = raw.get('overlap'), raw.get('valid')
+            if mask_mode == 'auto' and overlap is not None and valid is not None and overlap.mean() > 0:
+                if float(valid.mean()) / float(overlap.mean()) < _MASK_COVERAGE_WARN_RATIO:
+                    note += ' A máscara automática excluiu uma fração grande da área registrada; confira a máscara e compare com Somente sobreposição comum.'
+            status_var.set(f"Análise concluída em {session['analysis_seconds']:.1f} s. Projeto salvo: {target.name}.{note}")
         except Exception as exc:
-            if session.get('prepared') is None:
-                session["current_rgb"] = None
-                rebuild_layers(reset=True)
-                refresh_preview_content(legend=True)
-            status_var.set("Erro na análise.")
-            messagebox.showerror("Erro", str(exc))
+            session.clear()
+            session.update(previous)
+            for variable, value in previous_variables:
+                variable.set(value)
+            rebuild_image_rows()
+            for variable, enabled in zip(session['_active_vars'], flags):
+                variable.set(enabled)
+            if session.get('prepared') is not None:
+                setup_review()
+                refresh_group_listboxes()
+                rebuild_layers()
+                rebuild_compare_sources()
+            change_preview()
+            status_var.set('Não foi possível substituir a análise. O estado anterior foi preservado.')
+            messagebox.showerror('Erro na análise', str(exc))
         finally:
-            analyze_btn.config(state="normal")
+            analyze_btn.config(state='normal')
+            refresh_export_actions()
+
 
     def save_png_export(rgb, path, title):
         """Complete a PNG before replacing an existing user-selected export."""
         import os
         import tempfile
         temporary = None
-        try:
+        def write_png():
+            nonlocal temporary
             with export_batch():
                 destination = staged_file(path)
                 with tempfile.NamedTemporaryFile(prefix='.riima-png-', suffix='.png',
@@ -1777,6 +2228,8 @@ def gui(_test_hook=None) -> None:
                     temporary = Path(file.name)
                 Image.fromarray(rgb).save(temporary, format='PNG', compress_level=3, optimize=False)
                 os.replace(temporary, destination)
+        try:
+            run_operation('Exportando o PNG...', write_png)
             return True
         except Exception as exc:
             messagebox.showerror(title, str(exc))
@@ -1830,7 +2283,7 @@ def gui(_test_hook=None) -> None:
             return
         set_status('Calculando métricas das máscaras e uma amostra de atributos...')
         try:
-            directory = metrics.export_metrics(prepared)
+            directory = run_operation('Calculando e exportando as métricas...', metrics.export_metrics, prepared)
             status_var.set(f'Métricas exportadas em CSV: {directory}')
         except Exception as exc:
             messagebox.showinfo('Exportar métricas', str(exc))
@@ -1853,11 +2306,194 @@ def gui(_test_hook=None) -> None:
             return
         try:
             from . import report as riima_report
-            exported = riima_report.export_report(prepared, path, stage_callback=set_status)
+            exported = run_operation('Gerando o relatório...', riima_report.export_report,
+                                     prepared, path, stage_callback=set_status)
             status_var.set(f'Relatório descritivo exportado: {exported}')
         except Exception as exc:
             messagebox.showerror('Exportar relatório', str(exc))
             status_var.set(f'Não foi possível exportar o relatório: {exc}')
+
+    def refresh_export_actions():
+        prepared = session.get('prepared')
+        available = prepared is not None and not session['busy']
+        applied = available and not prepared['review'].has_pending
+        save_project_btn.config(state='normal' if available else 'disabled')
+        export_menu_btn.config(state='normal' if available else 'disabled')
+        for index, enabled in enumerate((applied, available and session.get('current_rgb') is not None,
+                                          available and bool(selected_workspace_groups()), applied, applied,
+                                          available, available)):
+            export_menu.entryconfigure(index, state='normal' if enabled else 'disabled')
+        similarity_btn.config(state='normal' if applied and bool(selected_workspace_groups()) else 'disabled')
+
+    def group_similarity_rows(data, selected):
+        """Resolve presentation from current IDs, keeping cached calculations unchanged."""
+        prepared = session['prepared']
+        state = prepared['review']
+        active_ids = [data['groups'][i]['id'] for i in data['active']]
+        if selected not in active_ids:
+            return []
+        row = active_ids.index(selected)
+        result = [dict(id=c, name=review_group_label(c), color=tuple(int(v) for v in state.palette[c]),
+                       similarity=float(data['similarity'][row, i]))
+                  for i, c in enumerate(active_ids) if c != selected and c in state.groups]
+        return sorted(result, key=lambda item: (-item['similarity'], item['id']))
+
+    def open_group_similarity():
+        if session['busy']:
+            return
+        prepared = session.get('prepared')
+        chosen = selected_workspace_groups()
+        if prepared is None or not chosen:
+            messagebox.showinfo('Similaridade', 'Selecione um grupo para comparar com os demais.')
+            return
+        if prepared['review'].has_pending:
+            messagebox.showinfo('Similaridade', 'Atualize a classificação antes de comparar os grupos.')
+            return
+        selected = chosen[0]  # Capture before the worker dispatches Tk events.
+        revision = session['science_revision']
+        window = tk.Toplevel(root)
+        similarity_windows.add(window)
+        def forget_window(event):
+            if event.widget is window:
+                similarity_windows.discard(window)
+        window.bind('<Destroy>', forget_window, add='+')
+        window.title('Similaridade entre grupos')
+        window.transient(root)
+        window.geometry('480x360')
+        window.minsize(380, 280)
+        panel = ttk.Frame(window, padding=12)
+        panel.pack(fill='both', expand=True)
+        group_heading = ttk.Label(panel, text=review_group_label(selected), style='Section.TLabel', wraplength=440)
+        group_heading.pack(anchor='w')
+        explanation = ttk.Label(panel, text='Afinidade relativa nesta análise; não indica identidade mineralógica.',
+                                 wraplength=440, style='Muted.TLabel')
+        explanation.pack(anchor='w', pady=(4, 8))
+        tree = ttk.Treeview(panel, columns=('affinity',), show='tree headings', height=7)
+        tree.heading('#0', text='Grupo comparado')
+        tree.heading('affinity', text='Afinidade')
+        tree.column('#0', width=310, minwidth=180)
+        tree.column('affinity', width=85, minwidth=75, anchor='e', stretch=False)
+        tree.pack(fill='both', expand=True)
+        note = ttk.Label(panel, text='Calculando perfis atuais...', wraplength=440, style='Muted.TLabel')
+        note.pack(anchor='w', pady=(6, 0))
+        window.bind('<Escape>', lambda _e: window.destroy())
+        try:
+            cache = session.get('similarity_cache')
+            if cache is not None and cache['prepared'] is prepared and cache['revision'] == revision:
+                data = cache['data']
+            else:
+                from . import report_data
+                data = run_operation('Comparando os grupos atuais...', report_data.collect_report_data, prepared)
+                if session.get('prepared') is not prepared or session['science_revision'] != revision:
+                    if window.winfo_exists():
+                        window.destroy()
+                    return
+                session['similarity_cache'] = dict(prepared=prepared, revision=revision, data=data)
+            if not window.winfo_exists():
+                return
+            by_id = {}
+            def sync_selection():
+                chosen = selected_workspace_groups()
+                for iid in tree.get_children():
+                    tree.item(iid, tags=('shared',) if int(iid) in chosen else ())
+            tree.tag_configure('shared', background=theme.ACCENT_SOFT)
+            def redraw():
+                group_heading.config(text=review_group_label(selected))
+                rows = group_similarity_rows(data, selected)
+                session['similarity_rows'] = rows
+                by_id.clear()
+                by_id.update({str(row['id']): row for row in rows})
+                tree.delete(*tree.get_children())
+                photos = []
+                for row in rows:
+                    swatch = ImageTk.PhotoImage(Image.new('RGB', (12, 12), row['color']), master=root)
+                    photos.append(swatch)
+                    tree.insert('', 'end', iid=str(row['id']), text=row['name'], image=swatch,
+                                values=(f"{row['similarity']:.3f}".replace('.', ','),))
+                window._swatches = photos
+                sync_selection()
+                note.config(text='Perfil: geometria, atributos ópticos e direção axial. Valores de 0 a 1.' if rows else
+                            'Sem dados para comparar este grupo; grupos vazios e de fundo ficam fora do cálculo.')
+            window._refresh, window._sync_selection = redraw, sync_selection
+            redraw()
+            def show_selected_name(_event=None):
+                selected_rows = tree.selection()
+                if selected_rows:
+                    row = by_id[selected_rows[0]]
+                    affinity = f"{row['similarity']:.3f}".replace('.', ',')
+                    note.config(text=f"{row['name']}\nAfinidade: {affinity}")
+                    select_groups([row['id']], add=True)
+            tree.bind('<<TreeviewSelect>>', show_selected_name)
+            def wrap_labels(event):
+                if event.widget is window:
+                    width = max(180, event.width - 28)
+                    for label in (group_heading, explanation, note):
+                        label.config(wraplength=width)
+            window.bind('<Configure>', wrap_labels, add='+')
+            tree.focus_set()
+            return window
+        except Exception as exc:
+            if window.winfo_exists():
+                note.config(text=f'Não foi possível comparar: {exc}')
+            status_var.set(f'Não foi possível calcular a similaridade: {exc}')
+            return window if window.winfo_exists() else None
+
+    def open_mask_comparison():
+        """Inspect the stored analysis mask against its actual geometric support."""
+        prepared = session.get('prepared')
+        if prepared is None or session['busy']:
+            return
+        state = prepared['review']
+        independent = state.mode == 'independent'
+        item = state.items[state.selected_image if independent else 0]
+        raw = item['optical'] if independent else prepared['optical']
+        window = tk.Toplevel(root)
+        window.title('Conferir máscara de análise')
+        window.transient(root)
+        panel = ttk.Frame(window, padding=12)
+        panel.pack(fill='both', expand=True)
+        window.bind('<Escape>', lambda _e: window.destroy())
+        overlap = raw.get('overlap')
+        if overlap is None and not independent:
+            ttk.Label(panel, text='Comparação indisponível: este projeto histórico não preservou a sobreposição '
+                      'geométrica. A máscara atual foi mantida sem supor outra área válida.',
+                      wraplength=470).pack()
+            return window
+        valid = np.asarray(raw['valid'], dtype=bool)
+        if overlap is None:
+            overlap = np.ones(valid.shape, bool)
+        rgb = item['rgb'] if independent else raw['images'][state.selected_image]
+        ttk.Label(panel, text='Máscara usada × domínio geométrico', style='Section.TLabel').pack(anchor='w')
+        ttk.Label(panel, text=('Campo independente: o domínio geométrico é a imagem inteira.' if independent else
+                  'A sobreposição limita o domínio válido do registro; a máscara automática é uma heurística de fundo.'),
+                  wraplength=640, style='Muted.TLabel').pack(anchor='w', pady=(4, 8))
+        previews = ttk.Frame(panel)
+        previews.pack(fill='both', expand=True)
+        window._mask_photos = []
+        for column, (title, mask) in enumerate((('Máscara usada na análise', valid),
+                                               ('Somente domínio geométrico', np.asarray(overlap, bool)))):
+            frame = ttk.Frame(previews)
+            frame.grid(row=0, column=column, padx=(0, 10) if column == 0 else (0, 0), sticky='n')
+            pixels = int(mask.sum())
+            ttk.Label(frame, text=f'{title}\n{pixels} pixels ({100 * pixels / max(1, mask.size):.1f}%)',
+                      justify='left').pack(anchor='w')
+            overlay = np.array(rgb, copy=True)
+            overlay[~mask] //= 5
+            image = Image.fromarray(overlay)
+            image.thumbnail((300, 280), Image.Resampling.NEAREST)
+            photo = ImageTk.PhotoImage(image, master=root)
+            window._mask_photos.append(photo)
+            ttk.Label(frame, image=photo).pack(pady=(6, 0))
+        ttk.Label(panel, text='Áreas fora de cada máscara aparecem escurecidas. A comparação usa a máscara da análise '
+                  'inicial; exclusões manuais da revisão são preservadas separadamente.', wraplength=640,
+                  style='Muted.TLabel').pack(anchor='w', pady=(8, 0))
+        def choose_geometric():
+            mask_mode_var.set('Somente sobreposição comum')
+            status_var.set('Máscara selecionada para a próxima classificação; resultado atual preservado.')
+            window.destroy()
+        action_button(panel, 'Usar somente sobreposição na próxima análise', choose_geometric,
+                      description='Apenas seleciona a opção. Clique em Gerar classificação quando desejar recalcular.').pack(anchor='w', pady=(8, 0))
+        return window
 
     # ---------- shell ----------
     header = ttk.Frame(root, padding=(14, 10, 14, 6))
@@ -1872,8 +2508,29 @@ def gui(_test_hook=None) -> None:
 
     project_actions = ttk.Frame(header)
     project_actions.pack(side='right')
-    ttk.Button(project_actions, text='Abrir projeto...', command=open_project).pack(side='left', padx=3)
-    ttk.Button(project_actions, text='Salvar projeto', command=save_project_current).pack(side='left', padx=3)
+    open_project_btn = action_button(project_actions, 'Abrir projeto...', open_project, icon='open',
+                                     description='Retoma imagens, marcações e classificação de um arquivo .riima.')
+    open_project_btn.pack(side='left', padx=3)
+    save_project_btn = action_button(project_actions, 'Salvar projeto', save_project_current, icon='save',
+                                     description='Guarda o progresso e as marcações pendentes no projeto portátil.')
+    save_project_btn.pack(side='left', padx=3)
+    export_menu = tk.Menu(root, tearoff=False, font=theme.FONT_BODY, background=theme.BG_PANEL,
+                          foreground=theme.TEXT_PRIMARY, postcommand=refresh_export_actions)
+    for label, command in [('Relatório descritivo (HTML)', export_descriptive_report),
+                           ('Visualização atual (PNG)', export_current),
+                           ('Máscara selecionada (PNG)', export_selected_mask),
+                           ('Exportação científica completa', export_scientific_current),
+                           ('Métricas (CSV)', export_light_metrics),
+                           ('Salvar projeto como...', lambda: save_project_current(choose=True)),
+                           ('Abrir pasta de resultados', open_output_folder)]:
+        export_menu.add_command(label=label, command=command)
+    export_menu_btn = ttk.Menubutton(project_actions, text='Exportar', image=desktop_icon('export'),
+                                    compound='left', menu=export_menu, style='Toolbar.TMenubutton', takefocus=True)
+    attach_tooltip(export_menu_btn, 'Exportar — Escolha relatório, imagem, máscara, métricas ou a árvore científica completa.')
+    export_menu_btn.pack(side='left', padx=3)
+    root.bind('<Control-s>', lambda _e: save_project_current() if not session['busy'] else None)
+    root.bind('<Control-o>', lambda _e: open_project() if not session['busy'] else None)
+    root.bind('<Control-Shift-S>', lambda _e: save_project_current(choose=True) if not session['busy'] else None)
     stepbar = ttk.Frame(root, padding=(14, 3, 14, 6))
     stepbar.pack(fill='x')
     step_buttons = {}
@@ -1888,16 +2545,17 @@ def gui(_test_hook=None) -> None:
     main.rowconfigure(0, weight=1)
 
     # ---------- sidebar (scrollable: viewer stays dominant even at small window sizes) ----------
-    sidebar_container = ttk.Frame(main, width=310)
+    sidebar_container = ttk.Frame(main, width=272)
     sidebar_container.grid(row=0, column=0, sticky="nsw")
     sidebar_container.grid_propagate(False)
-    sidebar_container.configure(width=310)
+    sidebar_container.pack_propagate(False)
+    sidebar_container.configure(width=272)
 
     sidebar_canvas = tk.Canvas(sidebar_container, highlightthickness=0, bd=0, bg=theme.BG_APP)
     sidebar_scroll = ttk.Scrollbar(sidebar_container, orient="vertical", command=sidebar_canvas.yview)
     sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
-    sidebar_canvas.pack(side="left", fill="both", expand=True)
     sidebar_scroll.pack(side="right", fill="y")
+    sidebar_canvas.pack(side="left", fill="both", expand=True)
 
     sidebar = ttk.Frame(sidebar_canvas, padding=(6, 4, 12, 4))
     sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
@@ -1939,33 +2597,20 @@ def gui(_test_hook=None) -> None:
     sidebar_container.bind("<Leave>", lambda _e: sidebar_canvas.unbind_all("<MouseWheel>"))
 
 
-    ttk.Label(sidebar, textvariable=workflow_hint_var, wraplength=265,
+    ttk.Label(sidebar, textvariable=workflow_hint_var, wraplength=216,
               foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=(0, 8))
-    navigation = ttk.Frame(sidebar)
-    navigation.pack(fill='x')
-    back_btn = ttk.Button(navigation, text='Anterior', command=previous_step)
-    back_btn.pack(side='left')
-    next_btn = ttk.Button(navigation, text='Próximo', command=advance_step, style='Primary.TButton')
-    next_btn.pack(side='right')
     step_frames = {key: ttk.Frame(sidebar) for key, _ in _WORKFLOW_STEPS}
-    images_step = step_frames['images']
-    classify_step = step_frames['classify']
-    organize_step = step_frames['organize']
-    refine_step = step_frames['refine']
-    results_step = step_frames['results']
+    images_step = classify_step = step_frames['preparation']
+    organize_step = refine_step = step_frames['interpretation']
     results_status_var = tk.StringVar()
     interpretation_slot = organize_step  # Compatibility for the existing callbacks.
     ttk.Label(images_step, text="Imagens", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
     ttk.Button(images_step, text="Selecionar imagens...", command=choose_images).pack(fill="x", pady=(0, 4))
-    ttk.Button(images_step, text='Abrir projeto...', command=open_project).pack(fill='x', pady=(0, 4))
     images_list_frame = ttk.Frame(images_step)
     images_list_frame.pack(fill="x", pady=(0, 2))
     ttk.Label(images_list_frame, text="Nenhuma imagem selecionada.", foreground=theme.TEXT_SECONDARY).pack(anchor="w")
-    ttk.Label(
-        images_step,
-        text="Selecione imagens do mesmo campo da lâmina. Elas serão alinhadas à referência e analisadas em conjunto. Para analisar uma imagem sozinha, selecione apenas ela.",
-        wraplength=270, foreground=theme.TEXT_SECONDARY,
-    ).pack(anchor="w", pady=(2, 8))
+    context_help(images_step, 'Selecione imagens do mesmo campo. Todas as imagens ativas contribuem para a análise; '
+                 'a referência serve ao alinhamento. Uma imagem isolada usa o mesmo fluxo.').pack(anchor='w', pady=(2, 6))
 
     ttk.Label(images_step, text="Pasta de resultados", foreground=theme.TEXT_SECONDARY).pack(anchor="w", pady=(0, 2))
     outrow = ttk.Frame(images_step)
@@ -1980,30 +2625,32 @@ def gui(_test_hook=None) -> None:
     ttk.Label(
         classify_step,
         text="Defina K e a máscara antes de executar a análise.",
-        wraplength=270, foreground=theme.TEXT_SECONDARY,
+        wraplength=216, foreground=theme.TEXT_SECONDARY,
     ).pack(anchor="w", pady=(0, 6))
     clusters_row = ttk.Frame(classify_step); clusters_row.pack(fill="x", pady=(0, 4))
     ttk.Label(clusters_row, text="Clusters ópticos").pack(side="left")
     ttk.Spinbox(clusters_row, from_=2, to=12, textvariable=clusters_var, width=6).pack(side="right")
+    analysis_mode_combo = ttk.Combobox(classify_step, textvariable=analysis_mode_var, state='readonly',
+                                      values=['Registradas (mesmo campo)', 'Independentes (campos distintos)'])
+    analysis_mode_combo.pack(fill='x', pady=(0, 5))
+    attach_tooltip(analysis_mode_combo, 'Modo de análise — Registradas alinha imagens do mesmo campo. '
+                   'Independentes compartilha a classificação óptica entre campos sem alinhá-los.')
     mask_row = ttk.Frame(classify_step); mask_row.pack(fill="x", pady=(0, 4))
     ttk.Label(mask_row, text="Máscara de análise").pack(side="left")
     mask_combo = ttk.Combobox(
-        mask_row, textvariable=mask_mode_var, state="readonly", width=22,
+        mask_row, textvariable=mask_mode_var, state="readonly", width=15,
         values=list(_MASK_MODE_LABELS.keys()),
     )
     mask_combo.pack(side="right")
-    ttk.Label(
-        classify_step,
-        text="Automática remove fundo e anotações. Use Somente sobreposição comum se alguma área válida for excluída.",
-        wraplength=270, foreground=theme.TEXT_SECONDARY,
-    ).pack(anchor="w", pady=(0, 8))
+    attach_tooltip(mask_combo, 'Máscara de análise — Automática busca remover fundo e anotações. '
+                   'Compare com Somente sobreposição comum se alguma área válida for excluída.')
 
     analyze_btn = ttk.Button(classify_step, text="Gerar classificação", style="Primary.TButton", command=analyze)
     analyze_btn.pack(fill="x", pady=(2, 6))
     ttk.Label(
         classify_step,
-        text="Os produtos da análise são salvos automaticamente.",
-        wraplength=270, foreground=theme.TEXT_SECONDARY,
+        text="O projeto é salvo automaticamente; exportações ficam no menu superior.",
+        wraplength=216, foreground=theme.TEXT_SECONDARY,
     ).pack(anchor="w", pady=(0, 4))
 
     # A stable, always-packed slot: diagnostics_frame is shown/hidden inside it (see
@@ -2018,44 +2665,80 @@ def gui(_test_hook=None) -> None:
     # Interpretação" out of view in a normal-height window.
     diagnostics_frame = ttk.Frame(diagnostics_slot, padding=(0, 4))
     ttk.Button(diagnostics_frame, text="Diagnóstico de K...", command=open_cluster_count_diagnostics).pack(fill="x")
-    ttk.Label(
-        diagnostics_frame,
-        text="Compara separação estatística para diferentes valores de K.",
-        wraplength=250, foreground=theme.TEXT_SECONDARY,
-    ).pack(anchor="w", pady=(3, 0))
+    attach_tooltip(diagnostics_frame.winfo_children()[0],
+                   'Diagnóstico de K — Compara separação estatística; a escolha final cabe ao especialista.')
+    action_button(diagnostics_frame, 'Conferir máscara', open_mask_comparison,
+                  description='Compare a máscara da análise com o domínio geométrico sem recalcular ou exportar.').pack(fill='x', pady=(4, 0))
 
     ttk.Separator(classify_step, orient="horizontal").pack(fill="x", pady=12)
     optical_group_frame = ttk.LabelFrame(organize_step, text="Grupos", padding=theme.SPACE_SM)
-    ttk.Label(
-        optical_group_frame,
-        text="Clique para selecionar um grupo. Shift + clique adiciona ou remove grupos para inspecionar a união.",
-        wraplength=250, foreground=theme.TEXT_SECONDARY,
-    ).pack(anchor="w", pady=(0, 5))
-    optical_group_list = tk.Listbox(optical_group_frame, height=5, selectmode=tk.BROWSE, exportselection=False)
-    optical_group_list.pack(fill="x")
-    optical_group_list.bind("<<ListboxSelect>>", on_group_selection)
-    optical_group_list.bind('<Button-1>', select_list_item)
-    optical_group_list.bind('<B1-Motion>', lambda event: 'break' if event.state & 1 else select_list_item(event))
-    ttk.Button(optical_group_frame, text='Limpar seleção', command=clear_group_selection).pack(fill='x', pady=(4, 0))
-    ttk.Button(optical_group_frame, text='Enviar seleção para fundo',
-               command=lambda: selected_groups_background(True)).pack(fill='x', pady=(4, 0))
-    ttk.Button(optical_group_frame, text='Restaurar seleção do fundo',
-               command=lambda: selected_groups_background(False)).pack(fill='x', pady=(4, 0))
-    og_buttons = ttk.Frame(optical_group_frame); og_buttons.pack(fill="x", pady=(5, 0))
-    ttk.Button(og_buttons, text="Unir", command=merge_optical_selected).pack(side="left")
-    ttk.Button(og_buttons, text="Desfazer", command=undo_optical_groups).pack(side="left", padx=4)
-    ttk.Button(og_buttons, text="Resetar", command=reset_optical_groups).pack(side="left")
-    og_buttons2 = ttk.Frame(optical_group_frame); og_buttons2.pack(fill="x", pady=(4, 0))
-    ttk.Button(og_buttons2, text="Renomear…", command=lambda: rename_selected_group(optical_group_list, "cluster")).pack(side="left")
-    ttk.Button(og_buttons2, text="Cor…", command=lambda: recolor_selected_group(optical_group_list, "cluster")).pack(side="left", padx=4)
+    group_list_frame = ttk.Frame(optical_group_frame)
+    group_list_frame.pack(fill='x')
+    group_tree = ttk.Treeview(group_list_frame, columns=('id', 'status'), show='tree headings',
+                              height=5, selectmode='extended')
+    optical_group_list = group_tree  # The historical internal name refers to the same real widget.
+    group_tree.heading('#0', text='Grupo'); group_tree.heading('id', text='ID'); group_tree.heading('status', text='Estado')
+    group_tree.column('#0', width=100, minwidth=55, stretch=True)
+    group_tree.column('id', width=28, minwidth=28, stretch=False, anchor='e')
+    group_tree.column('status', width=74, minwidth=55, stretch=False)
+    group_tree.tag_configure('active', font=theme.font('body', bold=True))
+    group_tree.pack(side='left', fill='both', expand=True)
+    group_scrollbar = ttk.Scrollbar(group_list_frame, orient='vertical', command=group_tree.yview)
+    group_scrollbar.pack(side='right', fill='y')
+    group_tree.config(yscrollcommand=group_scrollbar.set)
+    def scroll_groups(event):
+        direction = -int(event.delta / 120) if getattr(event, 'delta', 0) else (-1 if event.num == 4 else 1)
+        group_tree.yview_scroll(direction, 'units')
+        return 'break'
+    group_tree.bind('<MouseWheel>', scroll_groups)
+    group_tree.bind('<Button-4>', scroll_groups)
+    group_tree.bind('<Button-5>', scroll_groups)
+    group_tree.bind('<<TreeviewSelect>>', on_group_selection)
+    group_tree.bind('<Button-1>', select_list_item)
+    group_tree.bind('<KeyPress>', lambda _e: 'break' if session['busy'] else None)
+    group_tree.bind('<B1-Motion>', lambda _e: 'break' if session['busy'] else None)
+    group_tree.bind('<Double-Button-1>', activate_selected_group)
+    group_tree.bind('<Return>', activate_selected_group)
+    attach_tooltip(group_tree, 'Grupos — Clique seleciona; Shift/Ctrl + clique acrescenta ou remove. '
+                   'Enter ou duplo clique ativa o grupo para o pincel. A seleção para inspeção é independente do grupo ativo.')
+    manager_actions = ttk.Frame(optical_group_frame)
+    manager_actions.pack(fill='x', pady=(4, 0))
+    group_action_buttons = {}
+    for text, icon, command in [('Criar grupo', 'create', create_group_current),
+                                ('Renomear grupo', 'rename', rename_group_current),
+                                ('Alterar cor', 'color', recolor_group_current),
+                                ('Unir grupos', 'merge', merge_groups_current),
+                                ('Excluir grupo', 'delete', delete_group_current)]:
+        button = action_button(manager_actions, text, command, icon=icon, compound='image')
+        button.config(compound='image', style='Icon.TButton')
+        button.pack(side='left', padx=(0, 3))
+        group_action_buttons[icon] = button
+    group_undo_btn = action_button(manager_actions, 'Desfazer grupos', undo_group_current, icon='undo')
+    group_undo_btn.config(compound='image', style='Icon.TButton')
+    group_undo_btn.pack(side='left')
+    selection_actions = ttk.Frame(optical_group_frame)
+    selection_actions.pack(fill='x', pady=(4, 0))
+    clear_selection_btn = action_button(selection_actions, 'Limpar seleção', clear_group_selection, icon='clear',
+                                        description='Limpa a seleção sem alterar a classificação.')
+    clear_selection_btn.config(compound='image', style='Icon.TButton'); clear_selection_btn.pack(side='left')
+    similarity_btn = action_button(selection_actions, 'Similaridade', open_group_similarity, icon='similarity',
+                                   description='Compara o primeiro grupo selecionado com os demais, usando o estado aplicado.')
+    similarity_btn.pack(side='left', padx=(4, 0))
+    similarity_btn.config(compound='image', style='Icon.TButton')
+    activate_group_btn = action_button(selection_actions, 'Ativar grupo', activate_selected_group, icon='activate',
+                                       description='Escolhe o primeiro grupo selecionado como destino das marcações.')
+    activate_group_btn.config(compound='image', style='Icon.TButton'); activate_group_btn.pack(side='left', padx=4)
+    background_actions = selection_actions
+    for text, icon, value in [('Enviar seleção ao fundo', 'background', True), ('Restaurar seleção do fundo', 'restore', False)]:
+        button = action_button(background_actions, text, lambda chosen=value: selected_groups_background(chosen), icon=icon)
+        button.config(compound='image', style='Icon.TButton'); button.pack(side='left', padx=(0, 4))
 
     optical_group_frame.pack(fill="x")
     review_frame = ttk.LabelFrame(refine_step, text='Revisão dos grupos', padding=theme.SPACE_SM)
-    ttk.Label(review_frame, text='Revise um grupo de cada vez. Marque exemplos e atualize quando terminar.',
-              wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=(0, 4))
-    review_cluster_combo = ttk.Combobox(review_frame, textvariable=review_cluster_var, state='readonly')
-    review_cluster_combo.pack(fill='x', pady=3)
-    review_cluster_combo.bind('<<ComboboxSelected>>', select_review_cluster)
+    active_group_label = ttk.Label(review_frame, textvariable=active_group_var, wraplength=216,
+                                    font=theme.font('body', bold=True))
+    active_group_label.pack(fill='x', pady=(0, 4))
+    attach_tooltip(active_group_label, lambda: 'Grupo ativo: ' + review_group_label(session['prepared']['review'].selected_cluster))
     tools_row = ttk.Frame(review_frame)
     tools_row.pack(fill='x', pady=4)
     def activate_review_tool():
@@ -2069,42 +2752,90 @@ def gui(_test_hook=None) -> None:
     tools_row.columnconfigure(0, weight=1)
     tools_row.columnconfigure(1, weight=1)
     def choose_review_tool(tool):
+        if session['busy']:
+            return
         review_tool_var.set(tool)
         activate_review_tool()
-    for index, (text, value) in enumerate([('Manter', 'positive'), ('Remover', 'negative'),
-                                          ('Navegar', 'pan'), ('Apagar', 'erase'),
-                                          ('Fundo', 'background'), ('Restaurar área', 'restore')]):
-        button = ttk.Button(tools_row, text=text, command=lambda tool=value: choose_review_tool(tool))
-        button.grid(row=index // 2, column=index % 2, sticky='ew', pady=2, padx=(0, 2))
+    tool_descriptions = {
+        'positive': 'Exemplos positivos de aparência do grupo; aplique em Atualizar classificação.',
+        'negative': 'Exemplos de aparência que o grupo deve rejeitar; preserva os demais grupos.',
+        'pan': 'Arraste a imagem sem alterar exemplos ou exclusões.',
+        'erase': 'Apagar marcas — Limpa exemplos positivos e negativos do grupo; preserva o fundo.',
+        'background': 'Exclui pixels da análise na próxima atualização; respeita grupos prontos.',
+        'restore': 'Restaurar área — Reverte exclusões de fundo sem apagar exemplos.',
+    }
+    for index, (text, value) in enumerate([('Manter', 'positive'), ('Remover', 'negative'), ('Apagar marcas', 'erase'),
+                                          ('Fundo', 'background'), ('Restaurar área', 'restore'), ('Navegar', 'pan')]):
+        button = action_button(tools_row, text, lambda tool=value: choose_review_tool(tool),
+                                icon=value, description=tool_descriptions[value])
+        button.config(compound='image', style='Icon.TButton')
+        button.grid(row=0, column=index, sticky='ew', pady=2, padx=(0, 2))
         review_tool_buttons[value] = button
-    ttk.Label(review_frame, text='Remover exclui deste grupo. Fundo exclui de todos. Restaurar área devolve o fundo à análise. Apagar limpa marcações.',
-              wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=(0, 4))
     radius_row = ttk.Frame(review_frame)
     radius_row.pack(fill='x')
-    ttk.Label(radius_row, text='Raio do pincel (pixels)').pack(side='left')
-    ttk.Spinbox(radius_row, from_=1, to=100, textvariable=review_radius_var, width=5).pack(side='right')
+    ttk.Label(radius_row, text='Raio (px da imagem)').pack(side='left')
+    ttk.Label(radius_row, textvariable=review_radius_var, width=3, anchor='e').pack(side='right')
+
+    def set_review_radius(value):
+        radius = min(150, max(1, round(float(value))))
+        if review_radius_var.get() != radius:
+            review_radius_var.set(radius)
+
+    review_radius_scale = ttk.Scale(review_frame, from_=1, to=150, command=set_review_radius)
+    review_radius_scale.pack(fill='x')
+
+    def sync_review_radius(*_args):
+        radius = min(150, max(1, review_radius_var.get()))
+        review_radius_var.set(radius)
+        review_radius_scale.set(radius)
+        update_brush_outline()
+
+    review_radius_var.trace_add('write', sync_review_radius)
+    review_tool_var.trace_add('write', update_brush_outline)
+    review_enabled_var.trace_add('write', update_brush_outline)
+
+    def radius_key(event):
+        value = {'Home': 1, 'End': 150}.get(event.keysym)
+        if value is None:
+            value = review_radius_var.get() + (-1 if event.keysym in ('Left', 'Down') else 1)
+        set_review_radius(value)
+        return 'break'
+
+    for key in ('Left', 'Right', 'Up', 'Down', 'Home', 'End'):
+        review_radius_scale.bind('<' + key + '>', radius_key)
     review_update_btn = ttk.Button(review_frame, text='Atualizar classificação', command=refine_review_cluster)
     review_update_btn.pack(fill='x', pady=(3, 0))
-    review_undo_btn = ttk.Button(review_frame, text='Desfazer pincelada', command=undo_review_stroke)
-    review_undo_btn.pack(fill='x', pady=(3, 0))
-    review_reset_btn = ttk.Button(review_frame, text='Resetar grupo', command=reset_review_group)
-    review_reset_btn.pack(fill='x', pady=(3, 0))
+    correction_actions = ttk.Frame(review_frame)
+    correction_actions.pack(fill='x', pady=(3, 0))
+    review_undo_btn = action_button(correction_actions, 'Desfazer', undo_review_stroke, icon='undo',
+                                     description='Desfaz a última pincelada, incluindo todos os seus segmentos.')
+    review_undo_btn.pack(side='left')
+    review_undo_btn.config(compound='image', style='Icon.TButton')
+    review_reset_btn = action_button(correction_actions, 'Resetar grupo', reset_review_group,
+                                      description='Limpa exemplos e reinicia o aprendizado na próxima atualização.')
+    review_reset_btn.pack(side='left', padx=4)
+    review_reset_btn.config(image=desktop_icon('clear'), compound='image', style='Icon.TButton')
     ttk.Checkbutton(review_frame, text='Mostrar marcações', variable=show_applied_var,
                     command=change_preview).pack(anchor='w', pady=(4, 0))
     approval_row = ttk.Frame(review_frame)
     approval_row.pack(fill='x', pady=4)
-    review_approve_btn = ttk.Button(approval_row, text='Grupo pronto', command=approve_review_cluster)
+    review_approve_btn = action_button(approval_row, 'Aprovar grupo', approve_review_cluster, icon='activate',
+                                       description='Protege a máscara aplicada do grupo ativo.')
+    review_approve_btn.config(compound='image', style='Icon.TButton')
     review_approve_btn.pack(side='left')
-    review_reopen_btn = ttk.Button(approval_row, text='Reabrir', command=reopen_review_cluster)
+    review_reopen_btn = action_button(approval_row, 'Reabrir grupo', reopen_review_cluster, icon='undo')
+    review_reopen_btn.config(compound='image', style='Icon.TButton')
     review_reopen_btn.pack(side='left', padx=5)
-    ttk.Label(review_frame, textvariable=review_status_var, wraplength=250).pack(anchor='w')
-    ttk.Label(review_frame, text='As marcações ficam pendentes até Atualizar classificação. Grupo pronto protege toda a seleção. Salve o projeto para guardar o progresso.',
-              wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=(4, 0))
+    ttk.Label(review_frame, textvariable=review_status_var, wraplength=216, style='Muted.TLabel').pack(anchor='w')
+    review_help_btn = context_help(approval_row, 'As marcações ficam pendentes até Atualizar classificação. Grupo pronto protege toda a seleção. '
+                 'Salvar projeto guarda também exemplos pendentes. Ctrl+S salva; Ctrl+O abre um projeto.')
+    review_help_btn.config(compound='image', style='Icon.TButton')
+    review_help_btn.pack(side='right')
 
     legacy_masks_toggle = ttk.Checkbutton(organize_step, text='Seleções de projetos antigos',
                                          variable=legacy_masks_var, command=change_preview)
     family_group_frame = ttk.LabelFrame(organize_step, text="Associações salvas", padding=theme.SPACE_SM)
-    ttk.Label(family_group_frame, text="Use as associações existentes para selecionar máscaras dos grupos atuais.", wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor="w", pady=(0, 5))
+    ttk.Label(family_group_frame, text="Use as associações existentes para selecionar máscaras dos grupos atuais.", wraplength=216, foreground=theme.TEXT_SECONDARY).pack(anchor="w", pady=(0, 5))
     family_group_list = tk.Listbox(family_group_frame, height=4, selectmode=tk.BROWSE, exportselection=False)
     family_group_list.pack(fill="x", pady=(5, 0))
     family_group_list.bind('<Button-1>', select_list_item)
@@ -2123,20 +2854,6 @@ def gui(_test_hook=None) -> None:
 
 
     review_frame.pack(fill='x')
-    ttk.Label(results_step, text='Resultados', style='Section.TLabel').pack(anchor='w', pady=(0, 8))
-    ttk.Label(results_step, textvariable=results_status_var, wraplength=260).pack(anchor='w', pady=(0, 12))
-    ttk.Button(results_step, text='Salvar projeto', command=save_project_current).pack(fill='x', pady=3)
-    ttk.Button(results_step, text='Salvar projeto como...', command=lambda: save_project_current(choose=True)).pack(fill='x', pady=3)
-    ttk.Button(results_step, text='Exportar classificação e tabelas', command=autosave_current).pack(fill='x', pady=3)
-    ttk.Button(results_step, text='Exportar máscara selecionada', command=export_selected_mask).pack(fill='x', pady=3)
-    ttk.Button(results_step, text='Exportar visualização atual', command=export_current).pack(fill='x', pady=3)
-    ttk.Button(results_step, text='Exportar métricas', command=export_light_metrics).pack(fill='x', pady=3)
-    ttk.Label(results_step, text='Área, forma, direção e atributos em CSV. Calculados somente ao exportar.',
-              wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=4)
-    ttk.Button(results_step, text='Exportar relatório', command=export_descriptive_report).pack(fill='x', pady=3)
-    ttk.Label(results_step, text='Relatório HTML com a classificação, gráficos e tabelas da análise atual.',
-              wraplength=250, foreground=theme.TEXT_SECONDARY).pack(anchor='w', pady=4)
-    ttk.Button(results_step, text='Abrir pasta de resultados', command=open_output_folder).pack(fill='x', pady=3)
 
     # ---------- central preview + fixed legend viewport ----------
     workspace = ttk.Frame(main)
@@ -2146,15 +2863,20 @@ def gui(_test_hook=None) -> None:
 
     titlebar = ttk.Frame(workspace)
     titlebar.grid(row=0, column=0, sticky="ew", padx=(4, 0), pady=(2, 5))
-    ttk.Label(titlebar, textvariable=preview_title_var, font=theme.font('viewer', bold=True)).pack(side="left")
+    titlebar.columnconfigure(0, weight=1)
+    preview_title_label = ttk.Label(titlebar, textvariable=preview_title_var,
+                                    font=theme.font('viewer', bold=True), wraplength=320)
+    preview_title_label.grid(row=0, column=0, sticky='ew', padx=(0, 8))
 
     zoom_toolbar = ttk.Frame(titlebar)
-    zoom_toolbar.pack(side="right")
-    ttk.Button(zoom_toolbar, text="−", width=3, command=lambda: zoom_button(1 / 1.25)).pack(side="left", padx=1)
-    ttk.Button(zoom_toolbar, text="+", width=3, command=lambda: zoom_button(1.25)).pack(side="left", padx=1)
+    zoom_toolbar.grid(row=0, column=1, sticky='e')
+    action_button(zoom_toolbar, 'Diminuir zoom', lambda: zoom_button(1 / 1.25), icon='zoom_out', compound='image').pack(side='left', padx=1)
+    action_button(zoom_toolbar, 'Aumentar zoom', lambda: zoom_button(1.25), icon='zoom_in', compound='image').pack(side='left', padx=1)
     ttk.Button(zoom_toolbar, text="Ajustar", command=set_fit_mode).pack(side="left", padx=1)
     ttk.Button(zoom_toolbar, text="Largura", command=set_width_mode).pack(side="left", padx=1)
     ttk.Button(zoom_toolbar, text="100%", command=set_100_mode).pack(side="left", padx=1)
+    titlebar.bind('<Configure>', lambda event: preview_title_label.config(
+        wraplength=max(80, event.width - zoom_toolbar.winfo_reqwidth() - 8)))
 
     visual = ttk.Frame(workspace)
     visual.grid(row=1, column=0, sticky="nsew")
@@ -2169,10 +2891,12 @@ def gui(_test_hook=None) -> None:
     preview_canvas.bind("<B1-Motion>", on_canvas_drag)
     preview_canvas.bind("<ButtonRelease-1>", on_canvas_release)
     preview_canvas.bind("<Motion>", on_canvas_motion)
+    preview_canvas.bind('<Leave>', on_canvas_leave)
     preview_canvas.bind("<Double-Button-1>", on_canvas_double_click)
     preview_canvas.bind("<MouseWheel>", on_canvas_wheel)   # Windows/macOS
     preview_canvas.bind("<Button-4>", on_canvas_wheel)      # Linux, wheel up
     preview_canvas.bind("<Button-5>", on_canvas_wheel)      # Linux, wheel down
+    sync_review_radius()
 
     legend = ttk.LabelFrame(visual, text="Legenda", padding=6, width=260, height=520)
     legend.grid(row=0, column=1, sticky="ns", padx=(0, 4))
@@ -2233,7 +2957,38 @@ def gui(_test_hook=None) -> None:
     footer = ttk.Frame(root, padding=(14, 5, 14, 10))
     footer.pack(fill="x")
     ttk.Separator(footer, orient="horizontal").pack(fill="x", pady=(0, 6))
-    ttk.Label(footer, textvariable=status_var, foreground=theme.TEXT_SECONDARY).pack(anchor="w")
+    status_row = ttk.Frame(footer)
+    status_row.pack(fill='x')
+    operation_slot = ttk.Frame(status_row, width=30, height=24)
+    operation_slot.pack(side='left')
+    operation_slot.pack_propagate(False)
+    logo = Image.open(assets_dir / 'riima_logo.png').convert('RGBA')
+    logo.thumbnail((20, 20), Image.Resampling.LANCZOS)
+    logo_canvas = Image.new('RGBA', (24, 24))
+    logo_canvas.alpha_composite(logo, ((24 - logo.width) // 2, (24 - logo.height) // 2))
+    operation_frames = [ImageTk.PhotoImage(logo_canvas.rotate(angle, resample=Image.Resampling.BICUBIC), master=root)
+                        for angle in range(0, 360, 24)]
+    operation_progress = ttk.Label(operation_slot, image=operation_frames[0])
+    def stop_operation_indicator():
+        if session['operation_after'] is not None:
+            root.after_cancel(session['operation_after'])
+            session['operation_after'] = None
+        if operation_progress.winfo_exists():
+            operation_progress.place_forget()
+    def animate_operation_indicator():
+        session['operation_after'] = None
+        if not session['busy'] or not operation_progress.winfo_exists():
+            return
+        session['operation_frame'] = (session['operation_frame'] + 1) % len(operation_frames)
+        operation_progress.config(image=operation_frames[session['operation_frame']])
+        session['operation_after'] = root.after(40, animate_operation_indicator)
+    def start_operation_indicator():
+        stop_operation_indicator()
+        operation_progress.place(x=0, y=0, width=24, height=24)
+        animate_operation_indicator()
+    operation_progress.bind('<Destroy>', lambda event: stop_operation_indicator() if event.widget is operation_progress else None)
+    operation_status = ttk.Label(status_row, textvariable=status_var, foreground=theme.TEXT_SECONDARY)
+    operation_status.pack(side='left', fill='x', expand=True)
     ttk.Label(footer, textvariable=summary_var, style="Summary.TLabel", wraplength=1200).pack(anchor="w", pady=(2, 0))
 
     project_view_variables = tuple(value for value in locals().values() if isinstance(value, tk.Variable))

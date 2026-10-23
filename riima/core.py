@@ -101,14 +101,19 @@ def _edge_ncc(a: np.ndarray, b: np.ndarray, mask: np.ndarray | None = None) -> f
 
 
 def _warp_overlap(shape: tuple[int, int], matrix: np.ndarray) -> np.ndarray:
+    """Pixels whose full linear-interpolation support lies in the source image."""
     h, w = shape
-    src = np.ones((h, w), dtype=np.uint8) * 255
+    # Match the image warp's actual OpenCV interpolation weights (including their
+    # subpixel quantization). Nearest-neighbour support admits pixels partly made
+    # from reflected border values. Float coverage avoids integer rounding hiding
+    # a small out-of-image contribution; unity means every nonzero weight is real.
+    src = np.ones((h, w), dtype=np.float32)
     warped = cv2.warpAffine(
         src, matrix.astype(np.float32), (w, h),
-        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
-    return warped > 0
+    return warped == 1.0
 
 
 def register_pair(reference: np.ndarray, moving: np.ndarray):
@@ -1222,20 +1227,27 @@ def render_optical_confidence(confidence: np.ndarray, valid: np.ndarray) -> np.n
     return gray
 
 
-@export_operation
-def save_optical_statistics(labels, confidence, valid, out_dir: Path, k: int, filename: str = "cluster_statistics.csv"):
+def optical_statistics(labels, confidence, valid, k: int):
+    """Collect cluster area and mean confidence without filesystem access."""
     denom = int(valid.sum())
     rows = []
+    for c in range(k):
+        m = (labels == c) & valid
+        n = int(m.sum())
+        area = (100.0 * n / denom) if denom else 0.0
+        conf = float(confidence[m].mean()) if n else 0.0
+        rows.append({"cluster": c, "pixels": n, "area": area, "confidence": conf})
+    return rows
+
+
+@export_operation
+def save_optical_statistics(labels, confidence, valid, out_dir: Path, k: int, filename: str = "cluster_statistics.csv"):
+    rows = optical_statistics(labels, confidence, valid, k)
     with open(staged_file(out_dir / filename), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["cluster", "pixels", "area_percent_valid_image", "mean_confidence"])
-        for c in range(k):
-            m = (labels == c) & valid
-            n = int(m.sum())
-            area = (100.0 * n / denom) if denom else 0.0
-            conf = float(confidence[m].mean()) if n else 0.0
-            rows.append({"cluster": c, "pixels": n, "area": area, "confidence": conf})
-            w.writerow([c, n, area, conf])
+        for row in rows:
+            w.writerow([row['cluster'], row['pixels'], row['area'], row['confidence']])
     return rows
 
 
@@ -1337,9 +1349,9 @@ def make_contact_sheet(ppl, cpol, reps, out_path: Path, palette, patch, stats=No
 @export_operation
 def run_optical_analysis(
     image_paths: list[str], output: str, cfg: Config, reference_index: int = 0,
-    *, diagnostics: bool = False, mask_mode: str = "auto",
+    *, diagnostics: bool = False, mask_mode: str = "auto", publish_outputs: bool = True,
 ) -> dict:
-    """Register and jointly cluster N co-registered images; write the optical-stage outputs.
+    """Register and jointly cluster N co-registered images; optionally write outputs.
 
     Registration is always direct-to-reference (see ``register_images``); the reference
     image has no role beyond registration. Every image, including the reference,
@@ -1350,11 +1362,16 @@ def run_optical_analysis(
     :func:`analysis_mask_components`; ``"overlap_only"`` bypasses them and uses just the
     hard geometric registration overlap, for the (rare) case where the heuristic looks
     wrong on a particular slide. Never silently invented: see ``docs/METHOD.md``.
+
+    ``publish_outputs=False`` computes the same in-memory result without creating
+    the output directory or writing files. Diagnostic exports are also suppressed
+    in this mode, even when ``diagnostics=True``.
     """
     if not image_paths:
         raise ValueError("At least one active image is required for analysis.")
-    out_dir = staged_directory(output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if publish_outputs:
+        out_dir = staged_directory(output)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     registered = register_images(image_paths, reference_index)
     images = [im["rgb"] for im in registered["images"]]
@@ -1364,11 +1381,12 @@ def run_optical_analysis(
     valid = mask_parts["valid"]
     if not np.any(valid):
         raise ValueError("Registration left no common valid analysis area.")
-    Image.fromarray((valid.astype(np.uint8) * 255), mode="L").save(out_dir / "analysis_mask.png")
-    if diagnostics:
-        Image.fromarray((mask_parts["overlap"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_overlap.png")
-        Image.fromarray((mask_parts["specimen"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_specimen_support.png")
-        Image.fromarray((mask_parts["annotations"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_annotations.png")
+    if publish_outputs:
+        Image.fromarray((valid.astype(np.uint8) * 255), mode="L").save(out_dir / "analysis_mask.png")
+        if diagnostics:
+            Image.fromarray((mask_parts["overlap"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_overlap.png")
+            Image.fromarray((mask_parts["specimen"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_specimen_support.png")
+            Image.fromarray((mask_parts["annotations"].astype(np.uint8) * 255), mode="L").save(out_dir / "mask_annotations.png")
 
     sources = extract_optical_features(images, cfg.feature_blur_sigma)
     is_pair = len(images) == 2
@@ -1391,19 +1409,23 @@ def run_optical_analysis(
     ])
 
     palette = cluster_palette(cfg.clusters)
-    _save_png_fast(render_optical_clusters(labels, valid, palette), out_dir / "clusters.png")
-    _save_png_fast(render_optical_confidence(confidence, valid), out_dir / "optical_confidence.png", mode="L")
-    stats = save_optical_statistics(labels, confidence, valid, out_dir, cfg.clusters)
+    if publish_outputs:
+        _save_png_fast(render_optical_clusters(labels, valid, palette), out_dir / "clusters.png")
+        _save_png_fast(render_optical_confidence(confidence, valid), out_dir / "optical_confidence.png", mode="L")
+        stats = save_optical_statistics(labels, confidence, valid, out_dir, cfg.clusters)
+        np.save(out_dir / "clusters.npy", labels)
+    else:
+        stats = optical_statistics(labels, confidence, valid, cfg.clusters)
     similarity_pairs, nearest = cluster_similarity(centers)
-    np.save(out_dir / "clusters.npy", labels)
 
-    if diagnostics and is_pair:
+    if publish_outputs and diagnostics and is_pair:
         other_rgb = images[1] if reference_index == 0 else images[0]
         reps = find_representatives(fit["sample_idx"], flat_labels, fit["confidence"], fit["sample_X"], centers, 6)
         make_contact_sheet(reference_rgb, other_rgb, reps, out_dir / "diagnostic_representative_patches.png", palette, 96, stats=stats, nearest=nearest)
 
     image_names = [im["name"] for im in registered["images"]]
-    save_registration_csv(registered["images"], out_dir)
+    if publish_outputs:
+        save_registration_csv(registered["images"], out_dir)
 
     return {
         "output": str(Path(output)),
@@ -1494,13 +1516,18 @@ def save_session_outputs(prepared: dict, interpretation: Interpretation | None =
 @export_operation
 def prepare_analysis(image_paths: list[str], output: str, reference_index: int = 0,
                      optical_cfg: Config | None = None, *, diagnostics: bool = False,
-                     mask_mode: str = 'auto', stage_callback=None) -> dict:
-    """Compute clusters once; interpretation never reruns the analysis."""
+                     mask_mode: str = 'auto', stage_callback=None, publish_outputs: bool = True) -> dict:
+    """Compute clusters once; optionally publish outputs, including diagnostics.
+
+    With ``publish_outputs=False``, preparation and interpretation remain entirely
+    in memory; the output path is retained for later explicit exports.
+    """
     cfg = optical_cfg or Config()
     if stage_callback:
         stage_callback('Registrando e analisando imagens…')
     optical = run_optical_analysis(image_paths, output, cfg, reference_index=reference_index,
-                                   diagnostics=diagnostics, mask_mode=mask_mode)
+                                   diagnostics=diagnostics, mask_mode=mask_mode,
+                                   publish_outputs=publish_outputs)
     if stage_callback:
         stage_callback('Preparando interpretação de clusters…')
     return dict(output=str(output), optical=optical, config=cfg, interpretation=Interpretation(optical))

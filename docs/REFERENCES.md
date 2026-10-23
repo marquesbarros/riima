@@ -44,6 +44,13 @@ Breiman, L. (2001). **Random Forests.** *Machine Learning*, 45(1), p. 5-32. DOI:
 
 Escopo: florestas aleatórias como fundamento do refinamento supervisionado opcional implementado com [OpenCV RTrees](#opencv-docs). Exemplos anotados, proteção de grupos aprovados e aceitação de revisões são decisões do fluxo RIIMA. A eta quadrada descritiva do relatório não é a importância de variáveis de uma floresta.
 
+<a id="tax2001oneclass"></a>
+### Tax, 2001
+
+Tax, D. M. J. (2001). **One-class classification: concept-learning in the absence of counter-examples.** Tese de doutorado, Delft University of Technology, ASCI Dissertation Series 65. [Registro institucional](https://resolver.tudelft.nl/uuid:e588fc3e-7503-4013-9b6a-73c7b7f6b173).
+
+Escopo: descrição local por vizinhos mais próximos para exemplos de um único tipo. O suporte compara a distância da consulta ao exemplo mais próximo com o espaçamento entre esse exemplo e seu vizinho distinto. Não representa probabilidade mineralógica nem utiliza grupos automáticos como negativos confiáveis.
+
 <a id="rousseeuw1987silhouette"></a>
 
 <a id="calinski1974"></a>

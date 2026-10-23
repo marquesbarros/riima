@@ -6,6 +6,68 @@ import numpy as np
 
 
 from riima import viewer
+
+
+def test_analysis_summary_counts_current_groups_after_create_delete_and_merge(tmp_path):
+    from test_riima_review import eight_group_dataset
+    prepared = eight_group_dataset(tmp_path)
+    state = prepared['review']
+    raw = prepared['optical']['labels'].copy()
+    centers = prepared['optical']['centers'].copy()
+    assert '8 clusters brutos · 8 interpretados' in viewer.human_analysis_summary(prepared)
+    created = state.create_group('Novo vazio')
+    assert '8 clusters brutos · 9 interpretados' in viewer.human_analysis_summary(prepared)
+    state.delete_group(created)
+    assert '8 clusters brutos · 8 interpretados' in viewer.human_analysis_summary(prepared)
+    state.merge_groups([0, 1])
+    assert '8 clusters brutos · 7 interpretados' in viewer.human_analysis_summary(prepared)
+    assert state.undo_group_operation()
+    assert '8 clusters brutos · 8 interpretados' in viewer.human_analysis_summary(prepared)
+    np.testing.assert_array_equal(prepared['optical']['labels'], raw)
+    np.testing.assert_array_equal(prepared['optical']['centers'], centers)
+
+
+def test_analysis_summary_keeps_legacy_interpretation_count_without_review():
+    prepared = _session_fixture()
+    prepared['interpretation'].merge_clusters([0, 2])
+    assert '3 clusters brutos · 2 interpretados' in viewer.human_analysis_summary(prepared)
+
+
+def test_workspace_and_review_legends_use_current_group_names(tmp_path, monkeypatch):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path, count=1)
+    state = prepared['review']
+    # The renderer must use the catalog resolver rather than raw-cluster metadata.
+    monkeypatch.setattr(state, 'group_name', lambda group, interpretation=None: 'Nome atual', raising=False)
+    assert viewer.workspace_group_label(prepared, 0) == 'Nome atual'
+    assert viewer.workspace_legend(prepared)[0]['label'] == 'Nome atual'
+    assert viewer.build_preview_legend('Clusters em revisão', prepared)[0]['label'] == 'Nome atual'
+
+
+def test_sparse_created_groups_render_with_current_palette_and_retired_ids_disappear(tmp_path):
+    from test_riima_review import prepared_dataset
+    prepared = prepared_dataset(tmp_path, count=1)
+    state = prepared['review']
+    raw = prepared['optical']['labels'].copy()
+    centers = state.centers.copy()
+    retired = state.create_group('Descartado')
+    state.delete_group(retired)
+    created = state.create_group('Novo material', (17, 39, 63))
+    assert created > state.k and retired not in state.groups
+    rows = viewer.workspace_legend(prepared, [retired, created])
+    assert len(rows) == 1
+    assert rows[0]['label'] == 'Novo material'
+    assert rows[0]['color'] == (17, 39, 63)
+    assert rows[0]['detail'].startswith('0 pixels')
+    assert not viewer.workspace_mask(prepared, [created]).any()
+    # Exercise the renderer with an applied assignment beyond the raw K.
+    state.items[0]['labels'].flat[195] = created
+    rgb = viewer.render_workspace(prepared, 'Classificação')
+    np.testing.assert_array_equal(rgb.reshape(-1, 3)[195], [17, 39, 63])
+    np.testing.assert_array_equal(prepared['optical']['labels'], raw)
+    np.testing.assert_array_equal(state.centers, centers)
+
+
 def test_workspace_mask_uses_current_group_union_and_excludes_rejected_pixels(tmp_path):
     from test_riima_review import prepared_dataset
     prepared = prepared_dataset(tmp_path, count=1, clusters=3)

@@ -1,4 +1,4 @@
-"""Descriptive calculations over RIIMA CSVs, with NumPy and stable group IDs."""
+"""Descriptive calculations over in-memory metrics or CSVs, with stable group IDs."""
 from __future__ import annotations
 
 import csv
@@ -108,13 +108,31 @@ def number(value):
 
 
 def load_metrics(directory):
-    """Read current CSVs. Pooled legacy fields keep each ID distinct from its name."""
+    """Read existing CSV metrics through the same scientific in-memory builder."""
     folder = Path(directory)
-    summaries = _csv(folder / 'group_summary.csv')
-    catalog = _csv(folder / 'regions.csv')
-    attributes = _csv(folder / 'attribute_statistics.csv')
-    ranks = _csv(folder / 'attribute_separation.csv')
-    info = json.loads((folder / 'metrics_info.json').read_text(encoding='utf-8'))
+    return build_metrics_data(dict(
+        summary_rows=_csv(folder / 'group_summary.csv'), region_rows=_csv(folder / 'regions.csv'),
+        attribute_rows=_csv(folder / 'attribute_statistics.csv'),
+        ranks=_csv(folder / 'attribute_separation.csv'),
+        info=json.loads((folder / 'metrics_info.json').read_text(encoding='utf-8'))))
+
+
+def collect_report_data(prepared, *, sample_per_group=2000, min_area=9, max_regions=2000):
+    """Pure current-state profiles and Gaussian affinities; no intermediate files.
+
+    Similarity rows follow ``active`` indices into ``groups``. Stable group IDs
+    allow callers to resolve current presentation names/colors without recomputing.
+    Values describe affinity within this analysis, not mineral identity.
+    """
+    from .metrics import collect_metrics
+    return build_metrics_data(collect_metrics(prepared, sample_per_group=sample_per_group,
+                                              min_area=min_area, max_regions=max_regions))
+
+
+def build_metrics_data(collected):
+    """Pool scientific rows with the CSV reference formulas and original limits."""
+    summaries, catalog = collected['summary_rows'], collected['region_rows']
+    attributes, ranks, info = collected['attribute_rows'], collected['ranks'], collected['info']
     ids = sorted({int(r['group']) for r in summaries})
     images = {int(r['image_id']): dict(name=r['image'], valid=int(r['valid_pixels'])) for r in summaries}
     valid_pixels = sum(image['valid'] for image in images.values())
@@ -150,8 +168,8 @@ def load_metrics(directory):
                            mean_eccentricity=float(values['eccentricity'].mean()) if len(area) else np.nan,
                            mean_anisotropy=float(values['anisotropy'].mean()) if len(area) else np.nan,
                            dominant_direction_deg=direction, direction_coherence=coherence,
-                           approved=all(r['approved'] == 'True' for r in entries),
-                           background=all(r['background'] == 'True' for r in entries)))
+                           approved=all(r['approved'] in (True, 'True') for r in entries),
+                           background=all(r['background'] in (True, 'True') for r in entries)))
     features = list(dict.fromkeys(row['feature'] for row in attributes))
     index = {c: i for i, c in enumerate(ids)}
     feature_index = {f: j for j, f in enumerate(features)}

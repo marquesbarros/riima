@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from . import metrics
-from .report_data import load_metrics
+from .report_data import collect_report_data, load_metrics
 from .exports import export_operation, staged_directory, staged_file
 from .visual_style import document_css
 
@@ -75,10 +75,13 @@ def _summary_table(groups):
             + ''.join(rows) + '</tbody></table></div>')
 
 
-def build_report(prepared, directory, *, stage_callback=None):
-    """Compose fresh CSVs and current masks; no training, selection or display changes."""
+def build_report(prepared, directory=None, *, data=None, stage_callback=None):
+    """Compose current masks and memory metrics, or read an explicit legacy CSV set."""
     from .report_charts import make_charts
-    data = load_metrics(directory)
+    if data is None:
+        data = load_metrics(directory) if directory is not None else collect_report_data(prepared)
+    # Rendering adds presentation fields without mutating a caller's cached data.
+    data = dict(data, groups=[dict(group) for group in data['groups']])
     groups = data['groups']
     duplicates = Counter(g['name'] for g in groups)
     palette = prepared['review'].palette
@@ -146,7 +149,7 @@ def build_report(prepared, directory, *, stage_callback=None):
         'Direções isotrópicas ou sem resultante definida permanecem sem valor. Grupos sem pixels são mostrados nas tabelas '
         'e excluídos do cálculo de similaridade e padronização. Atributos constantes não geram descritores; ausências '
         'na similaridade são preenchidas pela média antes da padronização. O mapa de calor mostra até 16 atributos ópticos mais representativos '
-        'e quatro métricas geométricas. Os CSVs preservam todos os atributos.</p>'
+        'e quatro métricas geométricas. A exportação completa em CSV preserva todos os atributos.</p>'
         '<p>Similaridade usa todos os descritores variáveis do perfil; η² descreve a amostra de atributos ópticos, '
         'sem indicar importância do modelo ou identidade mineralógica. Densidades usam banda de Scott; não são desenhadas '
         'para amostras singulares. Rosetas usam anisotropia × √área; coerência e direção usam área × anisotropia.</p>'
@@ -160,15 +163,18 @@ def build_report(prepared, directory, *, stage_callback=None):
 
 
 @export_operation
-def export_report(prepared, filename=None, *, stage_callback=None):
-    """Refresh metrics and atomically export one portable HTML, without changing analysis."""
+def export_report(prepared, filename=None, *, stage_callback=None, export_metrics=False):
+    """Atomically publish portable HTML; opt in to coupled full metrics CSV exports."""
     if prepared['review'].has_pending:
         raise ValueError('Atualize a classificação antes de exportar o relatório.')
     if stage_callback:
         stage_callback('Calculando as métricas atuais para o relatório...')
-    staged_directory(prepared['output'])
-    directory = metrics.export_metrics(prepared)
-    html = build_report(prepared, staged_directory(directory), stage_callback=stage_callback)
+    if export_metrics:
+        staged_directory(prepared['output'])
+        directory = metrics.export_metrics(prepared)
+        html = build_report(prepared, staged_directory(directory), stage_callback=stage_callback)
+    else:
+        html = build_report(prepared, data=collect_report_data(prepared), stage_callback=stage_callback)
     target = Path(filename or Path(prepared['output']) / 'relatorio_analise_descritiva.html')
     target.parent.mkdir(parents=True, exist_ok=True)
     destination = staged_file(target)

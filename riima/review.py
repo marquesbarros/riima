@@ -1,15 +1,19 @@
 """Dataset-wide interactive cluster refinement and resumable projects.
 
 Initial optical labels are immutable. Review labels and approved masks have stable
-group IDs derived from the raw cluster IDs. This module contains no Tk code and
+group IDs independent of the immutable raw cluster provenance. This module contains no Tk code and
 never modifies input images.
 """
 from __future__ import annotations
 
 from dataclasses import asdict
+from copy import deepcopy
+import colorsys
 import csv
+import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import zipfile
@@ -19,6 +23,50 @@ import numpy as np
 
 from . import core
 from .exports import export_operation, staged_directory, staged_file
+
+def supervised_backend():
+    """Require the OpenCV ML interface used by saved and newly trained forests."""
+    ml = getattr(cv2, 'ml', None)
+    if not callable(getattr(ml, 'RTrees_create', None)) or not hasattr(ml, 'ROW_SAMPLE'):
+        raise RuntimeError(
+            'Revisão supervisionada indisponível: cv2.ml.RTrees_create não está disponível. '
+            f'OpenCV {getattr(cv2, "__version__", "desconhecido")}; '
+            f'módulo: {getattr(cv2, "__file__", "desconhecido")}. '
+            f'Interpretador: {sys.executable}. '
+            'Reinstale a dependência nesse interpretador: '
+            f'"{sys.executable}" -m pip install --upgrade --force-reinstall "opencv-python>=4.8,<5". '
+            'Evite instalar simultaneamente distribuições headless ou contrib do OpenCV.')
+    return ml
+class LocalOpticalSupport:
+    """Nearest-neighbour data description in the existing normalized feature space.
+
+    Accept a query only as close to its nearest example as that example is to
+    its nearest distinct training neighbour (Tax, 2001, section 3.4.2).
+    Also require every coordinate to lie within its observed training range,
+    preventing a broad spacing in one attribute from extrapolating another.
+    A single unique profile supports exact matches only, without a guessed radius.
+    """
+
+    def __init__(self, examples, *, exact=False):
+        self.examples = np.ascontiguousarray(np.unique(examples, axis=0), dtype=np.float32)
+        self.radius_squared = np.zeros(len(self.examples), np.float32)
+        self.minimum = self.examples.min(axis=0) if len(self.examples) else None
+        self.maximum = self.examples.max(axis=0) if len(self.examples) else None
+        if len(self.examples) > 1 and not exact:
+            distances, _ = cv2.batchDistance(self.examples, self.examples, cv2.CV_32F,
+                                             normType=cv2.NORM_L2SQR, K=2)
+            self.radius_squared = distances[:, 1]
+
+    def contains(self, queries):
+        if not len(self.examples):
+            return np.zeros(len(queries), bool)
+        distances, nearest = cv2.batchDistance(np.ascontiguousarray(queries, dtype=np.float32),
+                                               self.examples, cv2.CV_32F,
+                                               normType=cv2.NORM_L2SQR, K=1)
+        observed = np.all((queries >= self.minimum) & (queries <= self.maximum), axis=1)
+        return observed & (distances[:, 0] <= self.radius_squared[nearest[:, 0]])
+
+
 def prepare_independent_analysis(paths, output, cfg=None, *, mask_mode='auto', stage_callback=None):
     """Pool Lab/T samples from independent fields, without geometric registration."""
     cfg = cfg or core.Config()
@@ -98,11 +146,17 @@ class ClusterReview:
         state.config = prepared['config']
         state.k = int(optical['clusters'])
         state.groups = {c: {c} for c in range(state.k)}
+        state.group_names, state.retired_groups = {}, {}
+        state.next_group_id = state.k
+        state._group_undo, state._catalog_edited = [], False
+        state._legacy_group_names = {}
+        state._interpretation = prepared['interpretation']
         state.centers = np.asarray(optical['centers'], np.float32).copy()
         state.center = np.asarray(optical['center'], np.float32).copy()
         state.scale = np.asarray(optical['scale'], np.float32).copy()
         state.palette = np.asarray(optical['palette'], np.uint8).copy()
         state.completed, state.models, state.items, state.dirty = set(), {}, [], set()
+        state.refinement_order = []
         state.exclusion_dirty = False
         state.unresolved_dirty = set()
         state.background_groups, state.applied_background_groups = set(), set()
@@ -128,11 +182,211 @@ class ClusterReview:
                                     background_masks={},
                                     sources=entry.get('sources')))
         state.sync_groups(prepared.get('review_groups', prepared['interpretation'].groups))
+        interpretation = prepared['interpretation']
+        for index, members in enumerate(interpretation.groups):
+            group = min(members)
+            if state.groups.get(group) == members:
+                if index in interpretation.names:
+                    state._legacy_group_names[group] = interpretation.names[index]
+                if index in interpretation.colors:
+                    state.palette[group] = interpretation.colors[index]
         return state
 
     @property
     def class_ids(self):
         return sorted(self.groups)
+
+    def group_name(self, group, interpretation=None):
+        """Resolve current names by stable ID, with legacy raw-partition fallback."""
+        self._cluster(group)
+        if group in self.group_names:
+            return self.group_names[group] or f'Grupo {group}'
+        interpretation = interpretation if interpretation is not None else self._interpretation
+        if interpretation is not None and self.groups[group]:
+            for index, members in enumerate(interpretation.groups):
+                if members == self.groups[group]:
+                    return interpretation.names.get(index) or f'Grupo {group}'
+        return self._legacy_group_names.get(group) or f'Grupo {group}'
+
+    @property
+    def can_undo_group(self):
+        return bool(self._group_undo)
+
+    def _group_snapshot(self):
+        # Scientific inputs are immutable shared session data, never history.
+        excluded = {'items', 'config', 'k', 'centers', 'center', 'scale', '_group_undo', '_interpretation'}
+        metadata = {key: (dict(value) if key == 'models' else deepcopy(value))
+                    for key, value in self.__dict__.items() if key not in excluded}
+        item_keys = ('labels', 'locked', 'annotations', 'applied_annotations', 'excluded',
+                     'applied_excluded', 'display_valid', 'background_masks')
+        return metadata, [{key: deepcopy(item[key]) for key in item_keys} for item in self.items]
+
+    def _restore_group_snapshot(self, snapshot, *, retain_ids=False):
+        high_water, palette = self.next_group_id, self.palette
+        metadata, items = snapshot
+        for key in ('refinement_evidence',):
+            if key not in metadata:
+                self.__dict__.pop(key, None)
+        self.__dict__.update(metadata)
+        for item, saved in zip(self.items, items):
+            item.update(saved)
+        if retain_ids and high_water > self.next_group_id:
+            self.next_group_id = high_water
+            if len(self.palette) < high_water:
+                self.palette = np.concatenate((self.palette, palette[len(self.palette):high_water]))
+            self._catalog_edited = True
+
+    def _remember_group(self, snapshot):
+        self._group_undo.append(snapshot)
+        del self._group_undo[:-10]
+        # Keep at most 128 MiB of NumPy history, except the latest reversible op.
+        def size(value):
+            if isinstance(value, np.ndarray):
+                return value.nbytes
+            if isinstance(value, dict):
+                return sum(size(v) for v in value.values())
+            if isinstance(value, (tuple, list)):
+                return sum(size(v) for v in value)
+            return 0
+        while len(self._group_undo) > 1 and size(self._group_undo) > 128 * 1024 ** 2:
+            self._group_undo.pop(0)
+        self._catalog_edited = True
+        self._undo, self._stroke = [], None
+
+    def undo_group_operation(self):
+        """Restore the state before a group edit, including intervening review edits.
+
+        This bounded session history is separate from individual brush-stroke undo.
+        Successful group IDs remain consumed even when creation is undone.
+        """
+        if not self._group_undo:
+            return False
+        self._restore_group_snapshot(self._group_undo.pop(), retain_ids=True)
+        return True
+
+    def create_group(self, name='', color=None):
+        group = self.next_group_id
+        if group > min(np.iinfo(np.int32).max - self.config.seed, np.iinfo(np.int32).max - 1):
+            raise ValueError('Limite de identificadores de grupos atingido.')
+        if color is None:
+            candidates = np.array([tuple(round(v * 255) for v in colorsys.hsv_to_rgb(i / 360, s, v))
+                                   for s in (.55, .85) for v in (.72, 1.) for i in range(360)], np.int32)
+            active = self.palette[self.class_ids].astype(np.int32)
+            distances = np.min(np.sum((candidates[:, None] - active[None]) ** 2, axis=2), axis=1)
+            color = candidates[int(np.argmax(distances))]
+        color = core.Interpretation._color(color)
+        snapshot = self._group_snapshot()
+        self.groups[group] = set()
+        self.group_names[group] = str(name).strip()
+        self.palette = np.concatenate((self.palette, np.array([color], np.uint8)))
+        self.next_group_id += 1
+        self._remember_group(snapshot)
+        return group
+
+    def rename_group(self, group, name):
+        self._cluster(group)
+        name = str(name).strip()
+        if self.group_names.get(group) == name and group in self.group_names:
+            return
+        snapshot = self._group_snapshot()
+        self.group_names[group] = name
+        self._remember_group(snapshot)
+
+    def recolor_group(self, group, color):
+        self._cluster(group)
+        color = core.Interpretation._color(color)
+        if np.array_equal(self.palette[group], color):
+            return
+        snapshot = self._group_snapshot()
+        self.palette[group] = color
+        self._remember_group(snapshot)
+
+    def _retire_group(self, group, reason):
+        self.retired_groups[group] = dict(members=sorted(self.groups[group]), name=self.group_name(group),
+                                          color=self.palette[group].tolist(), reason=reason)
+        del self.groups[group]
+        self.group_names.pop(group, None)
+        self._legacy_group_names.pop(group, None)
+        self.models.pop(group, None)
+        for key in ('completed', 'dirty', 'unresolved_dirty', 'background_groups', 'applied_background_groups'):
+            getattr(self, key).discard(group)
+        self.refinement_order = [c for c in self.refinement_order if c != group]
+        if hasattr(self, 'refinement_evidence'):
+            self.refinement_evidence.pop(group, None)
+        for item in self.items:
+            for key in ('annotations', 'applied_annotations', 'background_masks'):
+                item[key].pop(group, None)
+
+    def merge_groups(self, ids):
+        selected = sorted(set(ids))
+        if len(selected) < 2:
+            raise ValueError('Selecione ao menos dois grupos para unir.')
+        for group in selected:
+            self._cluster(group, editable=True)
+        if any(c in self.background_groups for c in selected):
+            raise ValueError('Restaure os grupos de fundo antes de unir.')
+        target = selected[0]
+        snapshot = self._group_snapshot()
+        try:
+            self.group_names.setdefault(target, self.group_name(target))
+            reviewed = any(c in self.models or c in self.dirty or c in self.unresolved_dirty
+                           or any(np.any(item[key].get(c, 0)) for item in self.items
+                                  for key in ('annotations', 'applied_annotations')) for c in selected)
+            members = set().union(*(self.groups[c] for c in selected))
+            for item in self.items:
+                item['labels'][np.isin(item['labels'], selected)] = target
+                for key in ('annotations', 'applied_annotations'):
+                    if not any(c in item[key] for c in selected):
+                        continue
+                    merged = np.zeros(item['valid'].shape, np.int8)
+                    rejected_by_all = np.ones(item['valid'].shape, bool)
+                    for group in selected:
+                        marks = item[key].get(group)
+                        if marks is None:
+                            rejected_by_all.fill(False)
+                        else:
+                            rejected_by_all &= marks == -1
+                            merged[marks == 1] = 1
+                    merged[rejected_by_all] = -1
+                    item[key][target] = merged
+            for group in selected[1:]:
+                self._retire_group(group, f'merged_into:{target}')
+            self.groups[target] = members
+            self.models.pop(target, None)
+            if reviewed:
+                self.dirty.add(target)
+            if self.selected_cluster in selected:
+                self.selected_cluster = target
+        except Exception:
+            self._restore_group_snapshot(snapshot)
+            raise
+        self._remember_group(snapshot)
+        return target
+
+    def delete_group(self, group):
+        self._cluster(group, editable=True)
+        if len(self.groups) <= 1:
+            raise ValueError('Não é possível excluir o último grupo interpretativo disponível.')
+        filled = any(np.any(item['valid'] & (item['labels'] == group)) for item in self.items)
+        if filled and self.has_pending:
+            raise ValueError('Atualize a classificação para aplicar as marcações pendentes antes de excluir.')
+        if group in self.background_groups:
+            raise ValueError('Restaure o grupo de fundo antes de excluir.')
+        snapshot = self._group_snapshot()
+        try:
+            self._retire_group(group, 'deleted')
+            if filled:
+                self._predict()
+                for item in self.items:
+                    eligible = item['valid'] & ~item['excluded']
+                    if np.any(eligible & ~np.isin(item['labels'], self.class_ids)):
+                        raise ValueError('As restrições impedem uma reclassificação completa nos grupos de destino.')
+            if self.selected_cluster == group:
+                self.selected_cluster = self.class_ids[0]
+        except Exception:
+            self._restore_group_snapshot(snapshot)
+            raise
+        self._remember_group(snapshot)
 
     @property
     def has_pending(self):
@@ -182,7 +436,7 @@ class ClusterReview:
         return True
 
     def initial_labels(self, item):
-        lut = np.empty(self.k, np.int32)
+        lut = np.full(self.k, -1, np.int32)
         for group, members in self.groups.items():
             lut[list(members)] = group
         return lut[item['initial']]
@@ -191,6 +445,8 @@ class ClusterReview:
         """Adopt the interpretation partition without destroying existing reviews."""
         partition = core._validate_partition([set(g) for g in groups], self.k)
         incoming = {min(g): set(g) for g in partition}
+        if self._catalog_edited and incoming != self.groups:
+            raise ValueError('O catálogo atual usa identidades estáveis. Use as operações de grupos para reorganizá-lo.')
         unchanged = {c for c, members in self.groups.items() if incoming.get(c) == members}
         changed = set(self.groups) - unchanged
         for c in changed:
@@ -324,36 +580,78 @@ class ClusterReview:
         self.dirty.add(cluster)
         self._undo, self._stroke = [], None
 
-    def _fit_model(self, cluster):
-        """Fit one group from accumulated examples, without performing prediction."""
-        self._cluster(cluster, editable=True)
+    def _training_examples(self, cluster, rng=None, *, all_profiles=False):
+        """Sample forest training rows, or collect every distinct annotated profile.
+
+        Contradiction detection must see all evidence before the forest's brush
+        budget is applied. Build that inventory in chunks without materializing
+        another full set of feature planes or all repeated annotated rows.
+        """
         examples, responses = [], []
-        rng = np.random.default_rng(self.config.seed + cluster)
+        rng = rng if rng is not None else np.random.default_rng(self.config.seed + cluster)
+        profiles = {value: np.empty((0, len(self.center)), np.float32) for value in (-1, 1)}
         for item in self.items:
             marks = item['annotations'].get(cluster)
             if marks is None:
                 continue
             for value in (-1, 1):
                 idx = np.flatnonzero((marks == value) & item['valid'] & ~item['excluded'] & (item['locked'] < 0))
+                if all_profiles:
+                    for start in range(0, len(idx), self.config.chunk_pixels):
+                        chunk = self._features(item, idx[start:start + self.config.chunk_pixels])
+                        profiles[value] = np.unique(np.concatenate((profiles[value], np.unique(chunk, axis=0))), axis=0)
+                    continue
                 if len(idx) > 5000:
                     idx = rng.choice(idx, 5000, replace=False)
                 if len(idx):
                     examples.append(self._features(item, idx))
                     responses.append(np.full(len(idx), int(value == 1), np.int32))
-        if responses and len(np.unique(np.concatenate(responses))) == 2:
-            X, y = np.concatenate(examples), np.concatenate(responses)
+        if all_profiles:
+            for value in (-1, 1):
+                if len(profiles[value]):
+                    examples.append(profiles[value])
+                    responses.append(np.full(len(profiles[value]), int(value == 1), np.int32))
+        if not responses:
+            return np.empty((0, len(self.center)), np.float32), np.empty(0, np.int32)
+        return np.concatenate(examples), np.concatenate(responses)
+
+    @staticmethod
+    def _conflicting_examples(X, y):
+        unique, inverse = np.unique(X, axis=0, return_inverse=True)
+        positive = np.bincount(inverse[y == 1], minlength=len(unique)) > 0
+        negative = np.bincount(inverse[y == 0], minlength=len(unique)) > 0
+        conflict = positive & negative
+        return unique[conflict], conflict[inverse]
+
+    def _fit_model(self, cluster):
+        """Fit a binary forest only from optically separable positive/negative evidence."""
+        self._cluster(cluster, editable=True)
+        rng = np.random.default_rng(self.config.seed + cluster)
+        profiles, profile_responses = self._training_examples(cluster, all_profiles=True)
+        X, y = self._training_examples(cluster, rng)
+        if len(y):
+            conflicts, _ = self._conflicting_examples(profiles, profile_responses)
+            if len(conflicts):
+                # Structured numeric records compare rows exactly (including
+                # equivalent signed zeros) without a quadratic distance matrix.
+                row_dtype = np.dtype([(str(i), X.dtype) for i in range(X.shape[1])])
+                conflict = np.isin(np.ascontiguousarray(X).view(row_dtype).ravel(),
+                                   np.ascontiguousarray(conflicts).view(row_dtype).ravel())
+                X, y = X[~conflict], y[~conflict]
+        if len(np.unique(y)) == 2:
             # Balance brush sizes, preserving every sampled explicit example.
             positive, negative = np.flatnonzero(y == 1), np.flatnonzero(y == 0)
             n = max(len(positive), len(negative), 32)
             train_idx = np.concatenate([positive, rng.choice(positive, n - len(positive), replace=True),
                                         negative, rng.choice(negative, n - len(negative), replace=True)])
+            ml = supervised_backend()
             cv2.setRNGSeed(self.config.seed + cluster)
-            model = cv2.ml.RTrees_create()
+            model = ml.RTrees_create()
             model.setMaxDepth(12)
             model.setMinSampleCount(1)
             model.setActiveVarCount(X.shape[1])
             model.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 64, 0))
-            if not model.train(X[train_idx], cv2.ml.ROW_SAMPLE, y[train_idx]):
+            if not model.train(X[train_idx], ml.ROW_SAMPLE, y[train_idx]):
                 raise ValueError('Não foi possível treinar o refinamento.')
             # Insertion order records the latest successfully refined model.
             self.models.pop(cluster, None)
@@ -366,11 +664,14 @@ class ClusterReview:
     def refine(self, cluster):
         self._cluster(cluster, editable=True)
         previous_models = dict(self.models)
+        previous_order = list(self.refinement_order)
         try:
             trained = self._fit_model(cluster)
+            self.refinement_order = [c for c in previous_order if c != cluster] + [cluster]
             self._predict(preferred=cluster)
         except Exception:
             self.models = previous_models
+            self.refinement_order = previous_order
             raise
         self._commit_examples([cluster])
         return trained
@@ -398,6 +699,7 @@ class ClusterReview:
             # Global exclusions change the training samples of all open groups.
             pending = [c for c in self.class_ids if c not in self.completed]
         previous_models = dict(self.models)
+        previous_order = list(self.refinement_order)
         model_order = list(previous_models)
         try:
             trained = {c: self._fit_model(c) for c in pending if c not in self.background_groups}
@@ -405,19 +707,47 @@ class ClusterReview:
                 # Re-training for background alone must preserve learned precedence.
                 self.models = {c: self.models[c] for c in dict.fromkeys(model_order + list(self.models))
                                if c in self.models}
+            self.refinement_order = [c for c in previous_order if c not in edited] + sorted(edited)
             self._predict(preferred=preferred if preferred in edited else None)
         except Exception:
             self.models = previous_models
+            self.refinement_order = previous_order
             raise
         self._commit_examples(pending)
         return trained
 
     def _predict(self, preferred=None):
         open_ids = [c for c in self.class_ids if c not in self.completed and c not in self.background_groups]
-        # Latest edited model wins automatic conflicts; explicit positives always win.
-        order = [c for c in self.models if c in open_ids and c != preferred]
-        if preferred in self.models and preferred in open_ids:
-            order.append(preferred)
+        supports, conflicts, evidence = {}, {}, {}
+        for c in open_ids:
+            X, y = self._training_examples(c, all_profiles=True)
+            if not len(y):
+                continue
+            conflict, conflicting_rows = self._conflicting_examples(X, y)
+            if len(conflict):
+                conflicts[c] = LocalOpticalSupport(conflict, exact=True)
+                evidence[c] = 'conflicting'
+            clean_X, clean_y = X[~conflicting_rows], y[~conflicting_rows]
+            if len(np.unique(clean_y)) == 1:
+                unique = np.unique(clean_X, axis=0)
+                if len(unique) > 5000:
+                    rng = np.random.default_rng(self.config.seed + c)
+                    unique = unique[rng.choice(len(unique), 5000, replace=False)]
+                supports[c] = (int(clean_y[0]), LocalOpticalSupport(unique))
+                evidence[c] = ('positive' if clean_y[0] else 'negative') + ('_conflicting' if len(conflict) else '')
+        # Both evidence strategies use the same successful-update precedence.
+        # Missing historical entries retain support-before-forest semantics.
+        fallback = [c for c in supports if c not in self.models] + list(self.models)
+        actions = set(supports) | set(self.models)
+        marked = {c for item in self.items for c, marks in item['annotations'].items() if np.any(marks)}
+        next_order = [c for c in fallback if c not in self.refinement_order] + self.refinement_order
+        # Exclusions can temporarily hide all examples. Preserve their priority
+        # for restoration; erase/reset without remaining evidence removes it.
+        next_order = [c for c in next_order if c in self.groups and
+                      (c not in open_ids or c in actions or c in marked)]
+        if preferred in actions and preferred in open_ids:
+            next_order = [c for c in next_order if c != preferred] + [preferred]
+        order = [c for c in next_order if c in open_ids]
         updates = []
         for item in self.items:
             available = item['valid'] & ~item['excluded'] & (item['locked'] < 0)
@@ -434,11 +764,18 @@ class ClusterReview:
                     previous = baseline[idx]
                     retained = np.zeros(len(idx), bool)
                     predictions = {}
+                    support_matches = {c: model.contains(X) for c, (_, model) in supports.items()}
+                    for c in supports.keys() & conflicts.keys():
+                        support_matches[c] &= ~conflicts[c].contains(X)
+                    positive_claims = sum((support_matches[c].astype(np.int32) for c in supports if supports[c][0]),
+                                          start=np.zeros(len(idx), np.int32))
                     for c in open_ids:
                         d = np.full(len(idx), np.inf, np.float32)
                         for raw_id in self.groups[c]:
                             d = np.minimum(d, np.sum((X - self.centers[raw_id]) ** 2, axis=1))
                         allowed = np.ones(len(idx), bool)
+                        if c in supports and not supports[c][0]:
+                            allowed &= ~support_matches[c]
                         marks = item['annotations'].get(c)
                         if marks is not None:
                             allowed &= marks.ravel()[idx] != -1
@@ -446,7 +783,12 @@ class ClusterReview:
                         if model is not None:
                             _, predicted = model.predict(X)
                             predictions[c] = predicted.ravel() == 1
-                            allowed &= predictions[c]
+                            if c in conflicts:
+                                ambiguous = conflicts[c].contains(X)
+                                predictions[c] &= ~ambiguous
+                                allowed &= predictions[c] | ambiguous
+                            else:
+                                allowed &= predictions[c]
                         d = np.where(allowed, d, np.inf)
                         retained |= (previous == c) & allowed
                         take = d < best
@@ -454,7 +796,9 @@ class ClusterReview:
                     # Keep the current spatially regularized selection where admissible.
                     labels[retained] = previous[retained]
                     for c in order:
-                        take = predictions[c].copy()
+                        take = predictions.get(c, np.zeros(len(idx), bool)).copy()
+                        if c in supports and supports[c][0]:
+                            take |= support_matches[c] & (positive_claims == 1)
                         marks = item['annotations'].get(c)
                         if marks is not None:
                             take &= marks.ravel()[idx] != -1
@@ -469,6 +813,8 @@ class ClusterReview:
             updates.append(result)
         for item, result in zip(self.items, updates):
             item['labels'] = result
+        self.refinement_evidence = evidence
+        self.refinement_order = next_order
         if preferred in self.models and preferred in open_ids:
             # Persist the effective conflict order for future updates and save/resume.
             self.models[preferred] = self.models.pop(preferred)
@@ -566,7 +912,7 @@ def _validate_workspace(workspace, class_ids):
     for field in ('isolate', 'contours', 'show_applied', 'automatic_output'):
         if field in result and type(result[field]) is not bool:
             raise ValueError(f'Workspace inválido: {field} deve ser booleano.')
-    choices = dict(step=('images', 'classify', 'organize', 'refine', 'results'),
+    choices = dict(step=('preparation', 'interpretation', 'images', 'classify', 'organize', 'refine', 'results'),
                    display=('Imagem', 'Sobreposição', 'Classificação', 'Máscara selecionada', 'Grupo selecionado'),
                    view_type=('layers', 'compare'))
     for field, allowed in choices.items():
@@ -624,12 +970,93 @@ def _portable_output(path, history=()):
     return str(target)
 
 
+def _compact_project_arrays(arrays):
+    """Store exact duplicates once and narrow only losslessly bounded integers."""
+    stored, aliases, integer_dtypes, seen = {}, {}, {}, {}
+    # Keep review labels canonical when initial and current classifications agree.
+    keys = sorted(arrays, key=lambda key: (not key.endswith('_labels'), key))
+    for key in keys:
+        array = np.asarray(arrays[key])
+        if (key.endswith(('_initial', '_labels', '_locked')) and array.dtype.kind in 'iu'
+                and array.dtype.itemsize > 2 and array.size
+                and np.min(array) >= -1 and np.max(array) <= 254):
+            integer_dtypes[key] = array.dtype.str
+            array = array.astype(np.int16)
+        contiguous = np.ascontiguousarray(array)
+        fingerprint = (array.dtype.str, array.shape,
+                       hashlib.sha256(memoryview(contiguous).cast('B')).digest())
+        previous = seen.get(fingerprint)
+        if (previous is not None
+                and np.array_equal(contiguous.view(np.uint8), np.ascontiguousarray(stored[previous]).view(np.uint8))):
+            aliases[key] = previous
+        else:
+            seen[fingerprint] = key
+            stored[key] = array
+    return stored, aliases, integer_dtypes
+
+
+class _ProjectArrays:
+    """Expose logical arrays without loading every compressed member into memory."""
+
+    def __init__(self, archive, meta):
+        self.archive = archive
+        self.aliases = meta.get('array_aliases', {})
+        self.integer_dtypes = meta.get('integer_dtypes', {})
+        if meta['version'] >= 6 and not {'array_aliases', 'integer_dtypes'} <= meta.keys():
+            raise ValueError('Descritores de armazenamento ausentes no projeto.')
+        if not isinstance(self.aliases, dict) or not isinstance(self.integer_dtypes, dict):
+            raise ValueError('Descritores de armazenamento inválidos no projeto.')
+        allowed = {'centers', 'center', 'scale', 'palette'}
+        integer_keys = set()
+        for i, info in enumerate(meta['items']):
+            if type(info['image_count']) is not int or info['image_count'] < 1:
+                raise ValueError('Metadados de imagem inválidos no projeto.')
+            allowed.update(f'{i}_{key}' for key in (
+                'rgb', 'initial', 'labels', 'valid', 'locked', 'excluded', 'applied_excluded',
+                'confidence', 'sample_X', *_OPTIONAL_OPTICAL_ARRAYS))
+            integer_keys.update(f'{i}_{key}' for key in ('initial', 'labels', 'locked'))
+            allowed.update(f'{i}_image_{j}' for j in range(info['image_count']))
+            allowed.update(f'{i}_registered_overlap_{j}' for j in range(info['image_count']))
+            for c in info.get('annotations', []):
+                allowed.update((f'{i}_annotation_{c}', f'{i}_applied_annotation_{c}'))
+            allowed.update(f'{i}_background_mask_{c}' for c in info.get('background_masks', []))
+        physical = set(archive.files)
+        if len(physical) != len(archive.files):
+            raise ValueError('Arrays duplicados no projeto.')
+        for key, target in self.aliases.items():
+            if (key not in allowed or not isinstance(target, str) or target not in allowed
+                    or key in physical or target in self.aliases):
+                raise ValueError('Imagem ou máscara com referência de array inválida no projeto.')
+            # Older schema fixtures can intentionally omit applied-state members.
+            if meta['version'] >= 6 and target not in physical:
+                raise ValueError('Referência de array ausente no projeto.')
+        for key, dtype in self.integer_dtypes.items():
+            if (key not in integer_keys or not isinstance(dtype, str)
+                    or dtype not in ('<i4', '>i4', '<i8', '>i8', '<u4', '>u4', '<u8', '>u8')
+                    or (meta['version'] >= 6 and key not in physical and key not in self.aliases)):
+                raise ValueError('Rótulos com representação inteira inválida no projeto.')
+        self.files = list(dict.fromkeys([*archive.files, *self.aliases]))
+
+    def __contains__(self, key):
+        return key in self.files
+
+    def __getitem__(self, key):
+        array = self.archive[self.aliases.get(key, key)]
+        if key in self.integer_dtypes:
+            dtype = np.dtype(self.integer_dtypes[key])
+            if (array.dtype != np.int16 or np.any((array < -1) | (array > 254))
+                    or (dtype.kind == 'u' and np.any(array < 0))):
+                raise ValueError('Rótulos com representação inteira inválida no projeto.')
+            array = array.astype(dtype)
+        return array
+
+
 @export_operation
 def save_project(prepared, path):
     """Atomically store a self-contained numeric archive; never use pickle."""
     state = prepared['review']
     arrays = {}
-    metadata = dict(version=5, mode=state.mode, config=asdict(state.config), dirty=sorted(state.dirty),
+    metadata = dict(version=6, mode=state.mode, config=asdict(state.config), dirty=sorted(state.dirty),
                     sample_layout='shared' if state.mode == 'independent' else 'per_item',
                     output_history=_project_output_history(prepared),
                     exclusion_dirty=state.exclusion_dirty,
@@ -641,7 +1068,15 @@ def save_project(prepared, path):
                     selected_cluster=state.selected_cluster, output=prepared['output'],
                     workspace=prepared.get('workspace', {}),
                     interpretation=prepared['interpretation'].to_dict(), items=[],
-                    models={str(c): _model_text(m) for c, m in state.models.items()})
+                    models={str(c): _model_text(m) for c, m in state.models.items()},
+                    refinement_order=list(state.refinement_order))
+    if state._catalog_edited:
+        metadata.update(version=7,
+                        group_catalog=[dict(id=c, members=sorted(state.groups[c])) for c in state.class_ids],
+                        group_names={str(c): name for c, name in state.group_names.items()},
+                        retired_groups={str(c): entry for c, entry in state.retired_groups.items()},
+                        next_group_id=state.next_group_id,
+                        legacy_group_names={str(c): name for c, name in state._legacy_group_names.items()})
     for key in ('centers', 'center', 'scale', 'palette'):
         arrays[key] = getattr(state, key)
     for i, item in enumerate(state.items):
@@ -683,6 +1118,7 @@ def save_project(prepared, path):
             arrays[f'{i}_background_mask_{c}'] = mask
         for j, image in enumerate(raw['images']):
             arrays[f'{i}_image_{j}'] = image
+    arrays, metadata['array_aliases'], metadata['integer_dtypes'] = _compact_project_arrays(arrays)
     arrays['metadata'] = np.array(json.dumps(metadata, ensure_ascii=False, default=_json_value))
     path = Path(path)
     path = staged_file(path)
@@ -699,6 +1135,58 @@ def save_project(prepared, path):
             os.unlink(temp)
 
 
+def _restore_group_catalog(state, meta):
+    """Validate stable identities independently of the historical raw partition."""
+    catalog, next_id = meta['group_catalog'], meta['next_group_id']
+    if (not isinstance(catalog, list) or not catalog or type(next_id) is not int
+            or next_id < state.k or next_id > np.iinfo(np.int32).max - state.config.seed):
+        raise ValueError('Catálogo de grupos inválido.')
+    groups, seen = {}, set()
+    for entry in catalog:
+        if not isinstance(entry, dict) or set(entry) != {'id', 'members'}:
+            raise ValueError('Identidade de grupo inválida.')
+        group, members = entry['id'], entry['members']
+        if (type(group) is not int or not 0 <= group < next_id or group in groups
+                or not isinstance(members, list) or any(type(c) is not int or not 0 <= c < state.k for c in members)
+                or len(members) != len(set(members)) or seen.intersection(members)):
+            raise ValueError('Associações do catálogo de grupos inválidas.')
+        groups[group] = set(members)
+        seen.update(members)
+    def names(field):
+        incoming = meta[field]
+        if not isinstance(incoming, dict):
+            raise ValueError('Nomes do catálogo de grupos inválidos.')
+        result = {}
+        for key, name in incoming.items():
+            if (not isinstance(key, str) or not key.isdecimal() or str(int(key)) != key
+                    or int(key) not in groups or not isinstance(name, str)):
+                raise ValueError('Nomes do catálogo de grupos inválidos.')
+            result[int(key)] = name
+        return result
+    retired = meta['retired_groups']
+    if not isinstance(retired, dict):
+        raise ValueError('Proveniência de grupos excluídos inválida.')
+    retired_groups = {}
+    for key, entry in retired.items():
+        if (not isinstance(key, str) or not key.isdecimal() or str(int(key)) != key
+                or not 0 <= int(key) < next_id or int(key) in groups or not isinstance(entry, dict)
+                or set(entry) != {'members', 'name', 'color', 'reason'}
+                or not isinstance(entry['members'], list)
+                or any(type(c) is not int or not 0 <= c < state.k for c in entry['members'])
+                or len(entry['members']) != len(set(entry['members']))
+                or not isinstance(entry['name'], str) or not isinstance(entry['reason'], str)
+                or not isinstance(entry['color'], list) or len(entry['color']) != 3
+                or any(type(v) is not int or not 0 <= v <= 255 for v in entry['color'])):
+            raise ValueError('Proveniência de grupos excluídos inválida.')
+        retired_groups[int(key)] = deepcopy(entry)
+    if seen | {c for entry in retired_groups.values() for c in entry['members']} != set(range(state.k)):
+        raise ValueError('Proveniência dos clusters automáticos incompleta.')
+    state.group_names = names('group_names')
+    state._legacy_group_names = names('legacy_group_names')
+    state.groups, state.retired_groups = groups, retired_groups
+    state.next_group_id, state._catalog_edited = next_id, True
+
+
 def load_project(path):
     """Restore exactly the saved masks, including unfinished annotations."""
     try:
@@ -706,13 +1194,14 @@ def load_project(path):
             meta = json.loads(str(archive['metadata']))
             if not isinstance(meta, dict):
                 raise ValueError('Metadados de projeto inválidos.')
-            if meta.get('version') not in (1, 2, 3, 4, 5) or meta.get('mode') not in ('independent', 'registered'):
+            if meta.get('version') not in (1, 2, 3, 4, 5, 6, 7) or meta.get('mode') not in ('independent', 'registered'):
                 raise ValueError('Versão ou modo de projeto incompatível.')
             cfg = core.Config(**meta['config'])
             _validate_project_config(cfg)
             if (not isinstance(meta['items'], list) or not meta['items']
                     or (meta['mode'] == 'registered' and len(meta['items']) != 1)):
                 raise ValueError('Quantidade de imagens inválida no projeto.')
+            archive = _ProjectArrays(archive, meta)
             output_history = _project_output_history(meta)
             shared_sample = False
             if meta['version'] >= 5:
@@ -726,7 +1215,9 @@ def load_project(path):
                 if {key for key in archive.files if key.endswith('_sample_X')} != expected:
                     raise ValueError('Arrays da amostra incompatíveis com o formato do projeto.')
             palette = archive['palette'].copy()
-            if palette.dtype != np.uint8 or palette.shape != (cfg.clusters, 3):
+            palette_count = meta.get('next_group_id') if meta['version'] >= 7 else cfg.clusters
+            if (type(palette_count) is not int or palette_count < cfg.clusters
+                    or palette.dtype != np.uint8 or palette.shape != (palette_count, 3)):
                 raise ValueError('Paleta de cores inválida no projeto.')
             items = []
             for i, info in enumerate(meta['items']):
@@ -779,7 +1270,7 @@ def load_project(path):
                 optical = dict(reference=rgb, images=images, valid=valid, labels=initial,
                                confidence=confidence, sample_X=sample,
                                clusters=cfg.clusters, centers=centers, center=center, scale=scale,
-                               palette=optional.pop('palette', palette.copy()), image_names=info['image_names'],
+                               palette=optional.pop('palette', palette[:cfg.clusters].copy()), image_names=info['image_names'],
                                reference_index=info['reference_index'], mask_mode=info['mask_mode'],
                                registered_images=[dict(name=n) for n in info['image_names']],
                                feature_blur_sigma=cfg.feature_blur_sigma,
@@ -827,12 +1318,15 @@ def load_project(path):
                             config=cfg, optical=items[0]['optical'],
                             analysis_mode=meta['mode'], dataset_items=items,
                             workspace=meta.get('workspace', {}),
-                            review_groups=meta.get('groups', core.identity_groups(cfg.clusters)))
+                            review_groups=(meta['interpretation']['groups'] if meta['version'] >= 7 else
+                                           meta.get('groups', core.identity_groups(cfg.clusters))))
             prepared['interpretation'] = core.Interpretation(prepared['optical'])
             prepared['interpretation']._restore(meta['interpretation'])
             state = ClusterReview.from_prepared(prepared)
             state.items = items
             state.palette = archive['palette'].copy()
+            if meta['version'] >= 7:
+                _restore_group_catalog(state, meta)
             state.completed = set(meta['completed'])
             state.dirty = set(meta.get('dirty', []))
             state.exclusion_dirty = bool(meta.get('exclusion_dirty', False))
@@ -854,7 +1348,7 @@ def load_project(path):
                 for key in ('labels', 'locked'):
                     arr = item[key]
                     if (arr.dtype.kind not in 'iu' or arr.shape != item['valid'].shape
-                            or np.any((arr < -1) | (arr >= state.k))):
+                            or np.any((arr < -1) | (arr >= state.next_group_id))):
                         raise ValueError('Rótulos inválidos no projeto.')
                     item[key] = arr.astype(np.int32)
                 if np.any(item['valid'] & ~np.isin(item['labels'], [-1] + state.class_ids)):
@@ -894,8 +1388,9 @@ def load_project(path):
                         raise ValueError('Pendências de anotações inválidas.')
             state.models = {}
             for c, text in meta['models'].items():
+                ml = supervised_backend()
                 storage = cv2.FileStorage(text, cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
-                model = cv2.ml.RTrees_create()
+                model = ml.RTrees_create()
                 model.read(storage.getNode('model'))
                 storage.release()
                 if not model.isTrained() or model.getVarCount() != len(state.center):
@@ -903,6 +1398,26 @@ def load_project(path):
                 if int(c) not in state.groups:
                     raise ValueError('Grupo do modelo inválido.')
                 state.models[int(c)] = model
+            if 'refinement_order' in meta:
+                order = meta['refinement_order']
+                if (not isinstance(order, list) or any(type(c) is not int or c not in state.groups for c in order)
+                        or len(set(order)) != len(order)):
+                    raise ValueError('Ordem de precedência do refinamento inválida.')
+                state.refinement_order = list(order)
+            else:
+                # Restore historical precedence without computing features or
+                # changing the saved classification during opening.
+                one_sign = []
+                for c in state.class_ids:
+                    signs = set()
+                    for item in items:
+                        marks = item['annotations'].get(c)
+                        if marks is not None:
+                            allowed = item['valid'] & ~item['excluded'] & (item['locked'] < 0)
+                            signs.update(int(value) for value in np.unique(marks[allowed]) if value)
+                    if len(signs) == 1 and c not in state.models:
+                        one_sign.append(c)
+                state.refinement_order = one_sign + list(state.models)
             state.selected_image, state.selected_cluster = int(meta['selected_image']), int(meta['selected_cluster'])
             if state.selected_cluster not in state.groups:
                 raise ValueError('Seleção de cluster inválida.')
@@ -922,6 +1437,14 @@ def save_review_outputs(prepared):
     state = prepared['review']
     out = staged_directory(Path(prepared['output']) / 'review')
     out.mkdir(parents=True, exist_ok=True)
+    catalog = dict(next_group_id=state.next_group_id,
+                   groups=[dict(id=c, source_clusters=sorted(state.groups[c]),
+                                name=state.group_name(c, prepared.get('interpretation')),
+                                color=state.palette[c].tolist(), approved=c in state.completed,
+                                background=c in state.background_groups, pixels=state.counts(c))
+                           for c in state.class_ids],
+                   retired_groups={str(c): entry for c, entry in state.retired_groups.items()})
+    (out / 'catalog.json').write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8')
     with (out / 'statistics.csv').open('w', newline='', encoding='utf-8') as handle:
         writer = csv.writer(handle)
         writer.writerow(['image', 'group', 'source_clusters', 'pixels', 'approved'])
@@ -935,7 +1458,7 @@ def save_review_outputs(prepared):
             assigned = item['valid'] & (item['labels'] >= 0)
             rgb[assigned] = state.palette[item['labels'][assigned]]
             core._save_png_fast(rgb, folder / 'clusters.png')
-            core._save_png_fast(core.render_optical_clusters(state.initial_labels(item), item['valid'], state.palette), folder / 'initial.png')
+            core._save_png_fast(core.render_optical_clusters(item['initial'], item['valid'], item['optical']['palette']), folder / 'initial.png')
             for c in state.class_ids:
                 writer.writerow([item['name'], c, json.dumps(sorted(state.groups[c])),
                                  int((item['valid'] & (item['labels'] == c)).sum()), c in state.completed])

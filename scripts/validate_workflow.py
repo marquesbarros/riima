@@ -119,7 +119,7 @@ def resume(args):
     np.testing.assert_array_equal(restored['review'].items[0]['labels'], item['labels'])
     assert restored['review'].models[1].isTrained()
     start = time.perf_counter()
-    report = riima_report.export_report(restored, args.output / 'relatorio.html')
+    report = riima_report.export_report(restored, args.output / 'relatorio.html', export_metrics=True)
     record['report_seconds'] = round(time.perf_counter() - start, 3)
     record['resume_peak_working_set_mb'] = memory_mb()
     html = report.read_text(encoding='utf-8')

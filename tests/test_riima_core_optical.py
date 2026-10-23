@@ -190,6 +190,107 @@ def test_analysis_valid_mask_combines_specimen_overlap_and_annotations():
     assert valid[40, 90]
 
 
+@pytest.mark.parametrize('dx, dy, excluded_edge', [
+    (.25, 0., 'right'), (-.25, 0., 'left'),
+    (0., .25, 'bottom'), (0., -.25, 'top'),
+    (1 / 32, 0., 'right'), (-1 / 32, 0., 'left'),
+])
+def test_warp_overlap_excludes_pixels_requiring_bilinear_border_support(dx, dy, excluded_edge):
+    from riima.core import _warp_overlap
+
+    # The inverse map sends this edge partly outside the source. Nearest-neighbour
+    # support would wrongly include it although the image uses linear interpolation.
+    matrix = np.float32([[1., 0., dx], [0., 1., dy]])
+    expected = np.ones((8, 10), bool)
+    if excluded_edge == 'right':
+        expected[:, -1] = False
+    elif excluded_edge == 'left':
+        expected[:, 0] = False
+    elif excluded_edge == 'bottom':
+        expected[-1, :] = False
+    else:
+        expected[0, :] = False
+    np.testing.assert_array_equal(_warp_overlap(expected.shape, matrix), expected)
+
+
+@pytest.mark.parametrize('dx, dy', [(0., 0.), (2., -1.), (-2., 1.), (.001, -.001)])
+def test_warp_overlap_preserves_integer_and_quantized_identity_support(dx, dy):
+    from riima.core import _warp_overlap
+
+    matrix = np.float32([[1., 0., dx], [0., 1., dy]])
+    expected = np.ones((8, 10), bool)
+    if dx == 2.:
+        expected[:, -2:] = False
+        expected[0, :] = False
+    elif dx == -2.:
+        expected[:, :2] = False
+        expected[-1, :] = False
+    # OpenCV quantizes .001-pixel offsets to zero interpolation weight. A strict
+    # analytic coordinate check would discard pixels which are fully source-backed.
+    np.testing.assert_array_equal(_warp_overlap(expected.shape, matrix), expected)
+
+
+def test_registered_fractional_rotation_overlap_never_uses_reflected_source_pixels():
+    from riima.core import register_pair
+
+    reference = _synthetic_texture()
+    moving = warp_test_image(reference, dx=5., dy=-3., angle=.35)
+    _, info, overlap = register_pair(reference, moving)
+    assert info['method'] in {'phase_translation', 'ecc_euclidean'}
+    h, w = overlap.shape
+    # Real OpenCV linear weights, including their subpixel quantization, provide
+    # the source-coverage oracle for the transformation actually selected.
+    source_coverage = cv2.warpAffine(
+        np.ones((h, w), np.float32), info['matrix'], (w, h),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    assert np.any((source_coverage > 0) & (source_coverage < 1))
+    assert np.all(source_coverage[overlap] == 1.)
+    np.testing.assert_array_equal(overlap, source_coverage == 1.)
+
+
+@pytest.mark.parametrize('grain', [(0, 0, 0), (6, 6, 7), (35, 36, 37)])
+def test_automatic_mask_retains_enclosed_opaque_and_low_saturation_grains_under_uneven_light(grain):
+    from riima.core import analysis_mask_components
+
+    # A neutral illumination gradient, with scanner frame and enclosed specimen.
+    image = np.repeat(np.linspace(35, 180, 180, dtype=np.uint8)[None, :, None], 140, axis=0)
+    image = np.repeat(image, 3, axis=2)
+    image[:12] = image[-12:] = 2
+    image[:, :12] = image[:, -12:] = 2
+    image[45:85, 65:105] = grain
+    overlap = np.ones(image.shape[:2], bool)
+    overlap[:, -5:] = False
+
+    parts = analysis_mask_components([image], overlap)
+
+    assert parts['valid'][50:80, 70:100].all()
+    assert parts['valid'][30:110, 25:35].all()  # neutral dim specimen
+    assert not parts['valid'][:5].any()  # true dark frame
+    assert not parts['valid'][:, -5:].any()  # hard geometric exclusion
+
+
+def test_overlap_only_recovers_ambiguous_dark_edge_and_annotations_within_geometry():
+    from riima.core import analysis_mask_components
+
+    image = np.full((120, 160, 3), 140, np.uint8)
+    image[30:65, :40] = 2  # indistinguishable from border-connected background
+    image[100:103, 60:130] = (230, 20, 20)
+    overlap = np.ones(image.shape[:2], bool)
+    overlap[:, -3:] = False
+
+    automatic = analysis_mask_components([image], overlap)
+    geometric = analysis_mask_components([image], overlap, mask_mode='overlap_only')
+
+    assert not automatic['valid'][45, 20]
+    assert not automatic['valid'][101, 90]
+    assert geometric['valid'][45, 20]
+    assert geometric['valid'][101, 90]
+    np.testing.assert_array_equal(geometric['valid'], overlap)
+    assert not automatic['valid'][:, -3:].any()
+
+
 def test_run_saves_analysis_mask_and_registration_metadata(tmp_path):
     from riima.core import Config, run_optical_analysis
 
@@ -430,6 +531,95 @@ def test_run_multimodal_supports_a_single_image():
         result = riima_core.run_optical_analysis([p1], str(tmp_path / "out"), cfg, reference_index=0)
         assert result["labels"].shape == ppl.shape[:2]
         assert result["valid"].any()
+
+
+@pytest.mark.parametrize('entrypoint', ['run_optical_analysis', 'prepare_analysis'])
+@pytest.mark.parametrize('diagnostics', [False, True])
+def test_quiet_analysis_matches_published_science_without_creating_output_files(tmp_path, entrypoint, diagnostics):
+    from riima import core
+
+    [path] = write_rgb_images(tmp_path, [synthetic_color_texture_image(60, 80)])
+    cfg = core.Config(clusters=3, sample_pixels=600, kmeans_attempts=1)
+    published = core.run_optical_analysis([path], str(tmp_path / 'published'), cfg)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    output = tmp_path / 'quiet' / 'analysis'
+    if entrypoint == 'prepare_analysis':
+        prepared = core.prepare_analysis([path], str(output), optical_cfg=cfg,
+                                         diagnostics=diagnostics, publish_outputs=False)
+        quiet = prepared['optical']
+        np.testing.assert_array_equal(prepared['interpretation'].raw['labels'], quiet['labels'])
+    else:
+        quiet = core.run_optical_analysis([path], str(output), cfg,
+                                          diagnostics=diagnostics, publish_outputs=False)
+
+    assert not output.parent.exists()
+    after = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert after == before
+    for key in ['labels', 'confidence', 'valid', 'overlap', 'palette', 'sample_X',
+                'centers', 'feature_means', 'center', 'scale']:
+        np.testing.assert_array_equal(quiet[key], published[key], err_msg=key)
+    assert quiet['stats'] == published['stats']
+    assert quiet['similarity_pairs'] == published['similarity_pairs']
+    assert quiet['nearest'] == published['nearest']
+
+
+def test_optical_statistics_are_available_without_writing_and_keep_csv_values(tmp_path):
+    import csv
+    from riima import core
+
+    labels = np.array([[0, 0], [1, 2]])
+    confidence = np.array([[.5, .1], [.75, .9]], np.float32)
+    valid = np.array([[True, False], [True, False]])
+    expected = [dict(cluster=0, pixels=1, area=50., confidence=.5),
+                dict(cluster=1, pixels=1, area=50., confidence=.75),
+                dict(cluster=2, pixels=0, area=0., confidence=0.)]
+
+    assert core.optical_statistics(labels, confidence, valid, 3) == expected
+    assert not list(tmp_path.iterdir())
+    assert core.save_optical_statistics(labels, confidence, valid, tmp_path, 3) == expected
+    with (tmp_path / 'cluster_statistics.csv').open(newline='', encoding='utf-8') as stream:
+        rows = list(csv.reader(stream))
+    assert rows == [['cluster', 'pixels', 'area_percent_valid_image', 'mean_confidence'],
+                    ['0', '1', '50.0', '0.5'], ['1', '1', '50.0', '0.75'], ['2', '0', '0.0', '0.0']]
+
+
+def test_quiet_two_image_analysis_preserves_science_and_existing_exports(tmp_path):
+    from riima import core
+
+    paths = write_rgb_images(tmp_path, make_small_realistic_pair())
+    cfg = core.Config(clusters=3, sample_pixels=600, kmeans_attempts=1)
+    output = tmp_path / 'published'
+    published = core.run_optical_analysis(paths, str(output), cfg)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+
+    quiet = core.run_optical_analysis(paths, str(output), cfg, diagnostics=True, publish_outputs=False)
+
+    after = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert after == before
+    for key in ['labels', 'valid', 'overlap']:
+        np.testing.assert_array_equal(quiet[key], published[key], err_msg=key)
+    for key in ['confidence', 'sample_X', 'centers', 'feature_means', 'center', 'scale']:
+        np.testing.assert_allclose(quiet[key], published[key], rtol=1e-6, atol=1e-6, err_msg=key)
+    for current, previous in zip(quiet['registered_images'], published['registered_images']):
+        np.testing.assert_array_equal(current['rgb'], previous['rgb'])
+        # ECC has sub-micro-pixel repeat variability even between published runs.
+        np.testing.assert_allclose(current['registration']['matrix'], previous['registration']['matrix'],
+                                   rtol=1e-6, atol=1e-5)
+    assert quiet['stats'] == published['stats']
+
+
+def test_run_analysis_default_keeps_published_session_outputs(tmp_path):
+    from riima import core
+
+    [path] = write_rgb_images(tmp_path, [synthetic_color_texture_image(60, 80)])
+    out = tmp_path / 'published'
+    prepared = core.run_analysis([path], str(out), core.Config(clusters=3, sample_pixels=600))
+
+    assert {'clusters.npy', 'interpreted_clusters.npy', 'families.npy',
+            'clusters.png', 'analysis_mask.png', 'optical_confidence.png',
+            'registration.csv', 'cluster_statistics.csv', 'family_statistics.csv',
+            'interpretation.json', 'analysis_settings.json'} <= {p.name for p in out.iterdir()}
+    np.testing.assert_array_equal(np.load(out / 'clusters.npy'), prepared['optical']['labels'])
 
 
 def test_resolve_cli_images_supports_old_pair_and_new_multi_image_forms():

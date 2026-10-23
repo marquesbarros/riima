@@ -34,6 +34,25 @@ def test_package_entrypoint_and_bundled_resources():
     assert (ROOT / 'riima/templates/descriptive_report.html').is_file()
 
 
+def test_documented_workflow_resumes_and_validates_explicit_csv_export(tmp_path):
+    spec = importlib.util.spec_from_file_location('example_fields', ROOT / 'scripts/generate_example.py')
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    source = tmp_path / 'synthetic-inputs'
+    generator.write_fields(source)
+    output = tmp_path / 'workflow'
+    script = ROOT / 'scripts/validate_workflow.py'
+    for phase in ('prepare', 'resume'):
+        command = [sys.executable, '-B', str(script), phase, '--output', str(output)]
+        if phase == 'prepare':
+            command.extend(['--image', str(source / 'field_a.png')])
+        result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=90)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads((output / 'validation.json').read_text(encoding='utf-8'))['verified']
+    assert (output / 'relatorio.html').is_file()
+    assert len(list(output.rglob('group_summary.csv'))) == 1
+
+
 def test_share_archive_excludes_local_data_and_runs_from_extracted_folder(tmp_path):
     spec = importlib.util.spec_from_file_location('build_share', ROOT / 'scripts/build_share.py')
     builder = importlib.util.module_from_spec(spec)

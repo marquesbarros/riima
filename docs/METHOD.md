@@ -12,7 +12,7 @@ A indicação de registro fraco considera o escore final e sua melhora. É um av
 
 ## 2. Sobreposição e máscara
 
-A interseção das áreas registradas define a sobreposição comum O. Os padrões de `Config` recusam uma análise abaixo de 30% da imagem de referência e avisam entre 30% e 60%. São limites de segurança de software, sem calibração petrográfica independente.
+A interseção das áreas registradas define a sobreposição comum O. O suporte exige contribuição integral de pixels da imagem original na interpolação bilinear; valores refletidos nas bordas não ampliam o domínio válido. Os padrões de `Config` recusam uma análise abaixo de 30% da imagem de referência e avisam entre 30% e 60%. São limites de segurança de software, sem calibração petrográfica independente.
 
 No modo automático, a máscara é:
 
@@ -22,7 +22,7 @@ A = união das máscaras de anotação de todas as imagens
 V = O AND S AND NOT A
 ```
 
-`specimen_area_mask` usa brilho ou saturação como evidência de espécime e identifica fundo escuro conectado à borda. `red_annotation_mask` exige cor e evidência de forma, como alongamento ou contato com a borda, para reduzir exclusões de regiões vermelhas/rosadas reais. Essas máscaras são heurísticas; o usuário deve inspecionar `analysis_mask.png`. O modo `overlap_only` usa somente O, quando as exclusões automáticas não forem apropriadas.
+`specimen_area_mask` usa brilho ou saturação como evidência de espécime e identifica fundo escuro conectado à borda. `red_annotation_mask` exige cor e evidência de forma, como alongamento ou contato com a borda, para reduzir exclusões de regiões vermelhas/rosadas reais. Essas máscaras são heurísticas; o usuário deve inspecioná-las em **Conferir máscara**, na GUI, ou no produto exportado `analysis_mask.png`. O modo `overlap_only` usa somente O, quando as exclusões automáticas não forem apropriadas.
 
 Com diagnósticos ativados, os componentes da máscara também podem ser exportados. Nenhuma máscara atribui uma identidade mineral.
 
@@ -89,13 +89,14 @@ Selecionar a sugestão apenas modifica a configuração da próxima análise. O 
 São estados distintos:
 
 - **Clusters brutos:** labels produzidos pela análise automática, preservados imutáveis.
-- **Clusters interpretados:** grupos de IDs brutos definidos por uniões manuais, nomes e cores.
+- **Clusters interpretados:** partição histórica dos IDs brutos, preservada para a rastreabilidade da análise automática e da API legada.
+- **Grupos atuais:** catálogo com IDs estáveis, nomes e cores próprios. Pode incluir categorias criadas sem membros brutos; criar uma categoria vazia não acrescenta centros K-means nem pixels.
 - **Classificação revisada:** labels aplicados após exemplos Manter/Remover e exclusões; IDs dos grupos são preservados e máscaras aprovadas ficam protegidas.
 - **Famílias legadas:** associações de IDs brutos de projetos anteriores, disponíveis como seleções opcionais dentro do agrupamento.
 
 Uma união interpretativa altera o mapeamento, nunca os labels originais. Desfazer/restaurar interpretação não ajusta K-means nem refaz registro. A revisão pode mudar os labels aplicados, mantendo o mapa bruto. Uma união com pendências de revisão requer resolver essas pendências primeiro. Associações legadas continuam ligadas aos IDs brutos; não equivalem automaticamente à pertinência pixel a pixel aprendida depois.
 
-A interpretação é salva separadamente em `interpretation.json`. No retorno de `run_analysis`, `result['optical']` contém a análise bruta e `result['interpretation']` contém o estado manual. `save_session_outputs(prepared, interpretation=None)` grava produtos consistentes com o estado escolhido; ver a lista de saídas no [guia de utilização](USER_GUIDE.md#arquivos-de-saída).
+A interpretação integra o projeto `.riima`; a exportação científica também disponibiliza a partição histórica em `interpretation.json`. No retorno de `run_analysis`, `result['optical']` contém a análise bruta e `result['interpretation']` contém essa interpretação legada. `save_session_outputs(prepared, interpretation=None)` grava produtos consistentes com o estado escolhido. A classificação aplicada e o catálogo atual pertencem a `result['review']`; sua exportação em `review/` inclui `catalog.json` com IDs, nomes, cores e proveniência dos grupos ativos e retirados. Métricas, relatório e similaridade consultam os nomes atuais desse catálogo, com os nomes legados como alternativa; ver a lista de saídas no [guia de utilização](USER_GUIDE.md#arquivos-de-saída).
 
 ## 8. Estatísticas e configuração
 
@@ -111,11 +112,17 @@ A máscara e o registro exigem revisão, os limiares de segurança não têm val
 
 ## 10. Revisão sob comando e persistência
 
-Anotações são vinculadas às imagens de origem. `ClusterReview.refine_pending` aplica as mudanças acumuladas numa predição do conjunto. Com exemplos positivos e negativos, aprende um classificador binário por grupo usando RTrees do OpenCV, baseado em florestas aleatórias ([Breiman, 2001](REFERENCES.md#breiman2001forests); [OpenCV](REFERENCES.md#opencv-docs)). Sem ambos os tipos de exemplo não há um novo modelo binário; marcas explícitas e as regras dos grupos continuam relevantes. O refinamento não ajusta outra vez os centros K-means.
+Anotações são vinculadas às imagens de origem. `ClusterReview.refine_pending` aplica as mudanças acumuladas numa predição do conjunto. Com exemplos positivos e negativos separáveis, aprende um classificador binário por grupo usando RTrees do OpenCV, baseado em florestas aleatórias ([Breiman, 2001](REFERENCES.md#breiman2001forests); [OpenCV](REFERENCES.md#opencv-docs)). O refinamento não ajusta outra vez os centros K-means.
+
+Com apenas um tipo de exemplo, a descrição local por vizinho mais próximo usa o mesmo espaço óptico normalizado ([Tax, 2001](REFERENCES.md#tax2001oneclass)). Se `p` é o exemplo mais próximo da consulta `x` e `q` o vizinho distinto mais próximo de `p`, há suporte quando `dist(x,p) <= dist(p,q)`. O raio deriva do espaçamento observado, sem limiar de distância escolhido manualmente. Como restrição conservadora adicional, o RIIMA exige que cada atributo da consulta esteja entre o mínimo e o máximo observados nos exemplos; assim, grande variação de um atributo não autoriza extrapolação nos demais. Um único perfil distinto admite apenas correspondências exatas. O suporte usa a semente configurada e até 5.000 perfis distintos, enquanto a detecção de contradições percorre todos os exemplos válidos em blocos antes da amostragem.
+
+Suporte de **Manter** acrescenta regiões compatíveis sem rejeitar, por ausência de exemplos, a seleção inicial. Suporte de **Remover** rejeita somente esse grupo nas regiões compatíveis; os outros grupos continuam disputando os pixels. Os demais grupos não são convertidos em negativos implícitos. Conflitos entre suportes positivos de vários grupos não forçam uma escolha. Suportes positivos não ambíguos e florestas binárias usam uma ordem comum: a atualização mais recente prevalece nas reivindicações automáticas. Assim, um novo Manter pode corrigir uma floresta anterior, e uma atualização posterior dessa floresta pode rever a decisão. Marcações explícitas e pixels aprovados mantêm prioridade. A ordem é salva no projeto; atualizações exclusivas de fundo não a alteram. Perfis idênticos marcados com sinais opostos são excluídos do treino antes da amostragem e não recebem decisões automáticas daquele modelo.
+
+A descrição local é sensível à representatividade dos exemplos e não distingue materiais opticamente indistinguíveis ou contextos que não estão nos atributos. Exemplos heterogêneos ou isolados não estabelecem identidade mineralógica. Exemplos negativos ajudam a delimitar o grupo. O suporte é reconstruído das anotações persistidas, sem depender de arquivos de origem externos.
 
 Remover rejeita somente o grupo em edição. Excluir da análise retira pixels da competição até restaurá-los. Aprovar exige pendências aplicadas e protege toda a máscara final, incluindo pixels escolhidos pelo algoritmo. Reabrir libera somente esse grupo. Outros aprovados permanecem protegidos pixel a pixel.
 
-Projetos `.riima` autossuficientes preservam imagens, labels brutos/aplicados, anotações, máscaras, IDs, nomes, cores, modelos, exclusões e progresso. O esquema atual é versão 4, com compatibilidade legada validada. Escrita temporária e substituição evitam trocar o projeto válido por gravação incompleta; a carga valida esquema e integridade. Desfazer mantém histórico somente na sessão.
+Projetos `.riima` autossuficientes preservam imagens, labels brutos/aplicados, anotações, máscaras, IDs, nomes, cores, modelos, exclusões e progresso. O esquema atual é versão 6, com leitura dos esquemas 1–5. Arrays idênticos são armazenados uma vez; representações inteiras compactas restauram o dtype original. Escrita temporária e substituição evitam trocar o projeto válido por gravação incompleta; a carga valida esquema e integridade. Desfazer mantém histórico somente na sessão.
 
 ## 11. Métricas e relatório descritivo
 
@@ -123,8 +130,10 @@ Projetos `.riima` autossuficientes preservam imagens, labels brutos/aplicados, a
 
 Orientação é axial; direção e coerência usam área × anisotropia. Rosetas usam anisotropia × raiz da área, com ponderação diferente ([Fisher, 1993](REFERENCES.md#fisher1993); [Mardia e Jupp, 1999](REFERENCES.md#mardia1999directional)). η² resume separação óptica amostrada, sem constituir importância das árvores ou acurácia ([Richardson, 2011](REFERENCES.md#richardson2011)).
 
+Grupos vazios aparecem nas tabelas com área e contagens iguais a zero, sem medidas geométricas ou atributos inventados, e não entram na similaridade. IDs retirados deixam de aparecer nesses produtos. Categorias novas sem membros brutos e sem pixels aplicados não consomem o orçamento de amostragem dos grupos existentes; passam a compartilhá-lo quando recebem pixels. Grupos legados mantêm a regra anterior mesmo quando vazios. Renomear ou alterar a cor não modifica medidas, amostras ou afinidades.
+
 O relatório padroniza perfis de grupos, imputa médias somente para similaridade e calcula ligação de Ward ([Ward, 1963](REFERENCES.md#ward1963)). Histogramas/KDE usam largura de banda de Scott ([Scott, 1992](REFERENCES.md#scott1992density)). O gráfico de eixos chamado tipo Flinn 2D compara geometria e escala de regiões; não calcula X/Y versus Y/Z de deformação 3D ([Flinn, 1962](REFERENCES.md#flinn1962)).
 
 A renderização usual das figuras utiliza Matplotlib. Quando a importação dessa biblioteca falha com `ImportError` ou `OSError`, um gerador SVG do RIIMA apresenta as 14 figuras no mesmo HTML, usando as métricas já calculadas, nomes e cores dos grupos. Essa escolha altera a apresentação, que pode diferir entre os geradores, sem redefinir as medidas ou o estado aplicado. A seleção da alternativa limita-se à importação; erros posteriores de dados ou de renderização continuam sendo comunicados como falhas de exportação.
 
-Exportação exige pendências aplicadas e inclui classificação completa, nomes/cores atuais, seis seções, CSVs e imagens incorporadas ao HTML. Mapas são reduzidos somente na ilustração; contagens usam resolução original. Parâmetros, amostragem, omissões e valores indefinidos aparecem nos metadados. Os contratos de persistência estão em [PROJECT_FORMAT.md](PROJECT_FORMAT.md), e as fontes metodológicas em [REFERENCES.md](REFERENCES.md).
+Exportação exige pendências aplicadas e inclui classificação completa, nomes/cores atuais, seis seções e imagens incorporadas ao HTML. Relatório e similaridade podem consumir as métricas em memória, sem CSVs intermediários permanentes. `export_metrics` continua exportando os dados tabulares completos; `export_report(..., export_metrics=True)` publica HTML e CSVs no mesmo lote. Mapas são reduzidos somente na ilustração; contagens usam resolução original. Parâmetros, amostragem, omissões e valores indefinidos aparecem nos metadados. Os contratos de persistência estão em [PROJECT_FORMAT.md](PROJECT_FORMAT.md), e as fontes metodológicas em [REFERENCES.md](REFERENCES.md).

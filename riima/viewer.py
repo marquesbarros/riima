@@ -83,6 +83,9 @@ def workspace_mask(prepared: dict, selected_groups=None) -> np.ndarray:
 
 
 def workspace_group_label(prepared: dict, group: int) -> str:
+    state = prepared.get('review')
+    if state is not None:
+        return state.group_name(group, prepared.get('interpretation'))
     members = workspace_data(prepared)['groups'][group]
     label = f'Grupo {group}'
     for i, existing in enumerate(prepared['interpretation'].groups):
@@ -585,7 +588,7 @@ def build_preview_legend(mode: str, prepared: dict) -> list[dict]:
     """Keep raw identities, interpreted names and family memberships distinct."""
     if mode == 'Clusters em revisão':
         state = prepared['review']
-        return [dict(label='Grupo ' + '+'.join(str(v) for v in sorted(state.groups[c])),
+        return [dict(label=workspace_group_label(prepared, c),
                      color=tuple(int(v) for v in state.palette[c]),
                      detail=f"{state.counts(c)} pixels no conjunto; {'pronto' if c in state.completed else 'em revisão'}")
                 for c in state.class_ids]
@@ -626,11 +629,12 @@ def build_preview_legend(mode: str, prepared: dict) -> list[dict]:
 
 def human_analysis_summary(prepared: dict) -> str:
     optical = prepared["optical"]
-    current = _interpreted(prepared)
+    review = prepared.get('review')
+    group_count = len(review.groups) if review is not None else _interpreted(prepared)['clusters']
     families = _families(prepared)
     n = int(families["family_count"]) if families is not None else 0
     valid_pct = 100.0 * float(np.mean(optical["valid"]))
-    return (f"{optical['clusters']} clusters brutos · {current['clusters']} interpretados · "
+    return (f"{optical['clusters']} clusters brutos · {group_count} interpretados · "
             f"{n} famílias · área analisada {valid_pct:.1f}%").replace('.', ',')
 
 

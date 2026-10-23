@@ -101,6 +101,8 @@ _PREVIEW_MODES = ('Clusters em revisão', 'Clusters brutos', 'Clusters interpret
 # Frozen from the original viewer, before visual centralization, using the fixture
 # above. Hash input includes exact RGB bytes; shape and dtype are asserted as well.
 # Legend hashes use UTF-8 canonical JSON and preserve row order and full metadata.
+# The review legend follows current interpretive names; its label-only update
+# leaves every raster snapshot, color, count and status unchanged.
 _EXPECTED_WORKSPACE = {('Imagem', False): ((6, 8, 3), 'uint8', '63b333a234ad1f2ccfd4bcee4e3aa5a145e05b48e7c7c2f1bc2ecb906ee05935'),
  ('Imagem', True): ((6, 8, 3), 'uint8', '4bdc96ddbe8c1324667e1a01e4eb23c5a6057d2870f22dad2d18270b44d6140a'),
  ('Máscara selecionada', False): ((6, 8, 3),
@@ -124,7 +126,7 @@ _EXPECTED_PREVIEW = {'Clusters em revisão': ((6, 8, 3), 'uint8', '0a881d4555456
  'Contornos de clusters': ((6, 8, 3), 'uint8', '2c791d5d86270bbed7c9833d9af5fb8ac52bcf903a62b204e8b0a89bcc4a8d5e'),
  'Contornos de famílias': ((6, 8, 3), 'uint8', '73ff4abb74644071528bb8d4c8694d304e8dfaff5c73fc0ed679b65de5ff0050')}
 _EXPECTED_LEGENDS = {'workspace': '7c82cc51d2eeeed040661ac4b18f1571aff2ad3922761985ea30bf0fdbffa0fc',
- 'Clusters em revisão': 'd93347aae430cee6edd1615da3c4c6b7a095052df4ec67c319e8bf83f1fa93cd',
+ 'Clusters em revisão': '683e296ceeea0df309d3e88bb81f306aa9a834ed9174e0450b8fd86cc6261f26',
  'Clusters brutos': 'f48d0a776362c66d82deacf2e66bd6fa5154475c610e53047929f689c4332fd2',
  'Clusters interpretados': '4fe7d6746051447cb38ab9d990d37edce27c3da2017cc8d9355303414a4b0a3a',
  'Confiança óptica': '15cdb91946b92d2a12106f830c2196b21c63c95b013d15e252bd4afe3951cde8',
@@ -136,6 +138,8 @@ _EXPECTED_LEGENDS = {'workspace': '7c82cc51d2eeeed040661ac4b18f1571aff2ad3922761
 
 def test_viewer_scientific_pixels_match_original_snapshot():
     prepared = _scientific_viewer_fixture()
+    assert [row['label'] for row in viewer.build_preview_legend('Clusters em revisão', prepared)] == [
+        'Quartzo alterado: nome completo', 'Grupo 1', 'Grupo 2']
     for display in _WORKSPACE_DISPLAYS:
         for contours in (False, True):
             rgb = viewer.render_workspace(prepared, display, selected_groups=[0], opacity=.37,

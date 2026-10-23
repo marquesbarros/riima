@@ -1,4 +1,4 @@
-"""Bounded, on-demand geometric and sampled optical-attribute CSV exports.
+"""Bounded geometric and sampled optical metrics, with optional CSV publication.
 
 Connected regions are mask components, not inferred mineral grains. Angles use
 image coordinates: 0 degrees points right and 90 degrees points down.
@@ -102,24 +102,32 @@ def _write_csv(path, rows, columns, *, append=False):
         writer.writerows(rows)
 
 
-@export_operation
-def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=9, max_regions=2000):
-    """Export the applied state without fitting classifiers or changing image data."""
+def collect_metrics(prepared, *, sample_per_group=2000, min_area=9, max_regions=2000):
+    """Collect applied-state metrics without files, training or analysis mutations.
+
+    Sampling, region limits and row order are shared with the full CSV export.
+    Detailed geometry is bounded per image/group; this result retains those rows
+    across the dataset for consumers such as reports and contextual similarity.
+    """
+    return _collect_metrics(prepared, sample_per_group=sample_per_group,
+                            min_area=min_area, max_regions=max_regions)
+
+
+def _collect_metrics(prepared, *, sample_per_group, min_area, max_regions, region_sink=None):
+    """Shared calculation; CSV callers may stream each bounded geometry batch."""
     state = prepared['review']
     if state.has_pending:
         raise ValueError('Atualize a classificação antes de exportar as métricas.')
     if sample_per_group < 1:
         raise ValueError('A amostra das métricas deve ser positiva.')
-    destination = Path(directory or Path(prepared['output']) / 'metrics')
-    path = staged_directory(destination)
-    path.mkdir(parents=True, exist_ok=True)
-    summary_rows, attribute_rows = [], []
+    summary_rows, attribute_rows, region_rows = [], [], []
     identity_columns = ['image_id', 'image', 'group', 'group_name']
     region_columns = identity_columns + ['component_id', 'area_pixels', 'centroid_x_px', 'centroid_y_px',
         'major_axis_px', 'minor_axis_px', 'aspect_ratio', 'eccentricity', 'anisotropy', 'orientation_deg',
         'perimeter_grid_px', 'compactness_grid', 'equivalent_diameter_px', 'bbox_x', 'bbox_y',
         'bbox_width', 'bbox_height', 'touches_image_border']
-    _write_csv(path / 'regions.csv', [], region_columns)
+    if region_sink is not None:
+        region_sink([], region_columns, False)
     pooled = {}
     image_names = state.items[0]['optical']['image_names']
     unique_names = [f'Imagem {i + 1} ({name})' if image_names.count(name) > 1 else name
@@ -127,7 +135,15 @@ def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=
     feature_names = ([channel for channel in ('L*', 'a*', 'b*', 'T')] if state.mode == 'independent' else
                      [f'{name}: {channel}' for name in unique_names for channel in ('L*', 'a*', 'b*', 'T')])
     # Limit the total sample as well as every group's share, independently of image size.
-    per_group = min(int(sample_per_group), max(1, 10000 // len(state.class_ids)))
+    budget_groups = set(state.class_ids)
+    if any(not members for members in state.groups.values()):
+        populated = set()
+        for item in state.items:
+            populated.update(np.unique(item['labels'][item['display_valid']]).tolist())
+        # An unevidenced new category must not change existing seeded samples.
+        # Historical groups retain their share even when currently empty.
+        budget_groups = {c for c in state.class_ids if state.groups[c] or c in populated}
+    per_group = min(int(sample_per_group), max(1, 10000 // max(1, len(budget_groups))))
     rng = np.random.default_rng(state.config.seed)
     for image_id, item in enumerate(state.items):
         valid = item['display_valid']
@@ -140,9 +156,13 @@ def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=
             summary_rows.append(dict(**identity, **summary, valid_pixels=int(valid.sum()),
                                      area_percent=100 * summary['pixels'] / max(1, int(valid.sum())),
                                      approved=c in state.completed, background=c in state.background_groups))
-            # Stream detailed rows so additional images never accumulate a large
-            # in-memory region catalogue. Each geometry batch is bounded above.
-            _write_csv(path / 'regions.csv', (dict(**identity, **row) for row in regions), region_columns, append=True)
+            detailed = (dict(**identity, **row) for row in regions)
+            if region_sink is None:
+                region_rows.extend(detailed)
+            else:
+                # CSV exports still stream geometry instead of accumulating a
+                # catalogue proportional to the number of images.
+                region_sink(detailed, region_columns, True)
             indices = np.flatnonzero(mask)
             if len(indices):
                 sample = rng.choice(indices, min(len(indices), per_group), replace=False)
@@ -189,10 +209,6 @@ def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=
         'component_area_mean_px', 'component_area_median_px', 'component_area_std_px',
         'component_area_q25_px', 'component_area_q75_px', 'mean_eccentricity', 'mean_anisotropy',
         'dominant_direction_deg', 'direction_coherence']
-    _write_csv(path / 'group_summary.csv', summary_rows, summary_columns)
-    _write_csv(path / 'attribute_statistics.csv', attribute_rows,
-               identity_columns + ['feature', 'sampled_pixels', 'mean', 'std', 'q25', 'median', 'q75'])
-    _write_csv(path / 'attribute_separation.csv', ranks, ['rank', 'feature', 'separation_eta2', 'sampled_pixels', 'groups_sampled'])
     info = dict(version=1, units='pixels', connectivity=8, min_component_area_px=min_area,
                 max_measured_regions_per_group_image=max_regions, sample_per_group=sample_per_group,
                 effective_sample_per_group=per_group, max_sample_per_image=10000,
@@ -206,5 +222,33 @@ def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=
                 sources=['https://docs.opencv.org/4.x/d3/dc0/group__imgproc__shape.html',
                          'https://scikit-image.org/docs/stable/api/skimage.measure.html',
                          'https://itl.nist.gov/div898/handbook/prc/section4/prc431.htm'])
-    (path / 'metrics_info.json').write_text(json.dumps(info, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+    columns = dict(summary_rows=summary_columns, region_rows=region_columns,
+                   attribute_rows=identity_columns + ['feature', 'sampled_pixels', 'mean', 'std', 'q25', 'median', 'q75'],
+                   ranks=['rank', 'feature', 'separation_eta2', 'sampled_pixels', 'groups_sampled'])
+    return dict(summary_rows=summary_rows, region_rows=region_rows,
+                attribute_rows=attribute_rows, ranks=ranks, info=info, columns=columns)
+
+
+@export_operation
+def export_metrics(prepared, directory=None, *, sample_per_group=2000, min_area=9, max_regions=2000):
+    """Atomically publish the full metrics CSV set from the applied state."""
+    if prepared['review'].has_pending:
+        raise ValueError('Atualize a classificação antes de exportar as métricas.')
+    if sample_per_group < 1:
+        raise ValueError('A amostra das métricas deve ser positiva.')
+    destination = Path(directory or Path(prepared['output']) / 'metrics')
+    path = staged_directory(destination)
+    path.mkdir(parents=True, exist_ok=True)
+
+    def write_regions(rows, columns, append):
+        _write_csv(path / 'regions.csv', rows, columns, append=append)
+
+    data = _collect_metrics(prepared, sample_per_group=sample_per_group, min_area=min_area,
+                            max_regions=max_regions, region_sink=write_regions)
+    for key, filename in (('summary_rows', 'group_summary.csv'),
+                          ('attribute_rows', 'attribute_statistics.csv'),
+                          ('ranks', 'attribute_separation.csv')):
+        _write_csv(path / filename, data[key], data['columns'][key])
+    (path / 'metrics_info.json').write_text(
+        json.dumps(data['info'], indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
     return destination

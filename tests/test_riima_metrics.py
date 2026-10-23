@@ -9,6 +9,74 @@ from riima import metrics
 from test_riima_review import prepared_dataset
 
 
+def test_empty_created_group_does_not_reduce_existing_sampling_budget(tmp_path):
+    import cv2
+    from riima import core, report_data, review
+    colors = np.array([[40 + 22 * i, 60 + 15 * i, 180 - 17 * i] for i in range(8)], np.uint8)
+    rgb = np.repeat(np.repeat(colors[None, :, :], 48, axis=0), 48, axis=1)
+    image = tmp_path / 'eight-materials.png'
+    cv2.imwrite(str(image), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    prepared = review.prepare_independent_analysis([str(image)], str(tmp_path / 'out'),
+        core.Config(clusters=8, feature_blur_sigma=0, sample_pixels=4000), mask_mode='overlap_only')
+    state = prepared['review']
+    # Fix the applied segmentation so every group exercises the sampling cap.
+    state.items[0]['labels'][:] = np.repeat(np.arange(8), 48)[None, :]
+    assert np.bincount(state.items[0]['labels'].ravel()).min() > 1250
+    before = metrics.collect_metrics(prepared)
+    profiles = report_data.build_metrics_data(before)
+    created = state.create_group('Sem exemplos', (17, 39, 63))
+    after = metrics.collect_metrics(prepared)
+    assert after['info']['effective_sample_per_group'] == before['info']['effective_sample_per_group'] == 1250
+    for key in ('summary_rows', 'region_rows', 'attribute_rows'):
+        assert [row for row in after[key] if row['group'] != created] == before[key]
+    assert after['ranks'] == before['ranks']
+    current = report_data.build_metrics_data(after)
+    for key in ('similarity', 'linkage'):
+        np.testing.assert_array_equal(current[key], profiles[key])
+    # Once populated, a new category shares the cap; the now-empty legacy
+    # category still counts, preserving the historical budgeting contract.
+    state.items[0]['labels'][:, :48] = created
+    populated = metrics.collect_metrics(prepared)
+    assert populated['info']['effective_sample_per_group'] == 10000 // 9
+    assert {row['sampled_pixels'] for row in populated['attribute_rows']} == {10000 // 9}
+
+
+def test_created_empty_group_metrics_export_true_zero_and_current_names(tmp_path):
+    prepared = prepared_dataset(tmp_path, count=1)
+    state = prepared['review']
+    retired = state.create_group('Removido')
+    state.delete_group(retired)
+    created = state.create_group('Sem medidas', (17, 39, 63))
+    state.rename_group(0, 'Material atual')
+    data = metrics.collect_metrics(prepared)
+    assert {row['group'] for row in data['summary_rows']} == {0, 1, created}
+    empty = next(row for row in data['summary_rows'] if row['group'] == created)
+    assert empty['group_name'] == 'Sem medidas'
+    for key in ('pixels', 'area_percent', 'components_total', 'components_measured', 'components_omitted'):
+        assert empty[key] == 0
+    for key in ('component_area_mean_px', 'mean_eccentricity', 'mean_anisotropy', 'dominant_direction_deg'):
+        assert empty[key] is None
+    assert not any(row['group'] == created for row in data['region_rows'] + data['attribute_rows'])
+    exported = metrics.export_metrics(prepared, tmp_path / 'current-metrics')
+    with (exported / 'group_summary.csv').open(encoding='utf-8-sig') as handle:
+        rows = list(csv.DictReader(handle))
+    assert {int(row['group']) for row in rows} == {0, 1, created}
+    assert rows[0]['group_name'] == 'Material atual'
+
+
+def test_current_group_metadata_does_not_change_numeric_metrics(tmp_path):
+    prepared = prepared_dataset(tmp_path, count=1)
+    before = metrics.collect_metrics(prepared, sample_per_group=17)
+    state = prepared['review']
+    state.rename_group(0, 'Nome interpretativo')
+    state.recolor_group(0, (17, 39, 63))
+    after = metrics.collect_metrics(prepared, sample_per_group=17)
+    for key in ('summary_rows', 'region_rows', 'attribute_rows'):
+        strip_names = lambda rows: [{k: v for k, v in row.items() if k != 'group_name'} for row in rows]
+        assert strip_names(after[key]) == strip_names(before[key])
+    assert after['ranks'] == before['ranks']
+
+
 def test_rectangle_geometry_and_direction_are_exact_and_circular_regions_have_no_direction():
     mask = np.zeros((25, 45), bool)
     mask[8:13, 5:35] = True
@@ -115,3 +183,45 @@ def test_registered_metrics_preserve_all_4n_attribute_names_on_resume(tmp_path, 
     assert len(ranks) == 8
     assert len({row['feature'] for row in ranks}) == 8
     assert all(item['sources'] is None for item in restored['review'].items)
+
+
+def test_collect_metrics_is_in_memory_and_preserves_sample_order_and_geometry(tmp_path):
+    prepared = prepared_dataset(tmp_path, count=1)
+    item = prepared['review'].items[0]
+    item['labels'].fill(-1)
+    item['labels'][1:4, 1:5] = 0
+    item['labels'][8:11, 12:16] = 1
+    # Integer source planes make the exact seeded sample independently checkable.
+    plane = np.arange(item['labels'].size, dtype=np.float32).reshape(item['labels'].shape)
+    item['sources'] = [plane + j * 1000 for j in range(4)]
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert callable(getattr(metrics, 'collect_metrics', None)), 'metrics need a pure collection API'
+    data = metrics.collect_metrics(prepared, sample_per_group=3, min_area=1, max_regions=1)
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()} == before
+    assert [row['group'] for row in data['summary_rows']] == [0, 1]
+    assert [row['area_pixels'] for row in data['region_rows']] == [12, 12]
+    assert [row['perimeter_grid_px'] for row in data['region_rows']] == [14, 14]
+    rng = np.random.default_rng(prepared['config'].seed)
+    for group in (0, 1):
+        sampled = rng.choice(np.flatnonzero(item['labels'] == group), 3, replace=False)
+        rows = [r for r in data['attribute_rows'] if r['group'] == group]
+        assert [r['feature'] for r in rows] == ['L*', 'a*', 'b*', 'T']
+        for j, row in enumerate(rows):
+            assert row['sampled_pixels'] == 3
+            assert row['mean'] == pytest.approx(sampled.mean() + j * 1000)
+            assert row['std'] == pytest.approx(sampled.std())
+            np.testing.assert_allclose([row['q25'], row['median'], row['q75']],
+                                       np.percentile(sampled, [25, 50, 75]) + j * 1000)
+    assert data['info']['effective_sample_per_group'] == 3
+    assert len(data['ranks']) == 4
+
+
+def test_collect_metrics_rejects_pending_edits_without_writing_or_changing_labels(tmp_path):
+    prepared = prepared_dataset(tmp_path, count=1)
+    prepared['review'].exclude(0, [195], True)
+    before = prepared['review'].items[0]['labels'].copy()
+    assert callable(getattr(metrics, 'collect_metrics', None)), 'metrics need a pure collection API'
+    with pytest.raises(ValueError, match='Atualiz'):
+        metrics.collect_metrics(prepared)
+    np.testing.assert_array_equal(prepared['review'].items[0]['labels'], before)
+    assert not (tmp_path / 'out/metrics').exists()

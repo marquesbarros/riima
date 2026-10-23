@@ -16,12 +16,32 @@ def file_bytes(folder):
             for p in folder.rglob('*') if p.is_file()}
 
 
+def test_publication_dispatch_failure_cleans_staging_and_resets_context(tmp_path):
+    from riima.exports import export_batch, staged_file, in_export
+    target = tmp_path / 'result.txt'
+    target.write_text('previous')
+    before = file_bytes(tmp_path)
+
+    def unavailable(write):
+        raise RuntimeError('worker unavailable')
+
+    with pytest.raises(RuntimeError, match='worker unavailable'):
+        with export_batch(publish=unavailable):
+            staged_file(target).write_text('new')
+    assert not in_export()
+    assert file_bytes(tmp_path) == before
+    with export_batch():
+        staged_file(target).write_text('retry')
+    assert target.read_text() == 'retry'
+
+
 @pytest.mark.parametrize('failure', ['html_write', 'html_publish'])
-def test_report_failure_preserves_metrics_and_external_html(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize('with_metrics', [False, True])
+def test_report_failure_preserves_metrics_and_external_html(tmp_path, monkeypatch, failure, with_metrics):
     prepared = prepared_dataset(tmp_path)
     target = tmp_path / 'Relatório ç.html'
     monkeypatch.setattr(report, 'build_report', lambda *args, **kwargs: '<html>complete report</html>')
-    report.export_report(prepared, target)
+    report.export_report(prepared, target, export_metrics=with_metrics)
     before, state = file_bytes(tmp_path), scientific_state(prepared)
     with monkeypatch.context() as patch:
         if failure == 'html_write':
@@ -49,10 +69,10 @@ def test_report_failure_preserves_metrics_and_external_html(tmp_path, monkeypatc
                 return original(source, destination)
             patch.setattr(report.os, 'replace', fail)
         with pytest.raises(OSError, match='HTML'):
-            report.export_report(prepared, target)
+            report.export_report(prepared, target, export_metrics=with_metrics)
     assert file_bytes(tmp_path) == before
     assert scientific_state(prepared) == state
-    assert report.export_report(prepared, target) == target
+    assert report.export_report(prepared, target, export_metrics=with_metrics) == target
     assert file_bytes(tmp_path) == before
 
 
@@ -176,7 +196,7 @@ def test_report_and_metrics_are_one_generation_when_rendering_fails(tmp_path, mo
         raise OSError('simulated chart failure')
     monkeypatch.setattr(report, 'build_report', fail)
     with pytest.raises(OSError, match='simulated'):
-        report.export_report(prepared, target)
+        report.export_report(prepared, target, export_metrics=True)
     assert file_bytes(output) == before
     assert target.read_bytes() == b'previous complete HTML'
     assert scientific_state(prepared) == state

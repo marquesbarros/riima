@@ -40,7 +40,7 @@ def main() -> None:
     prepared = core.prepare_analysis([str(image)], str(Path.cwd() / 'report-output'),
                                      optical_cfg=core.Config(clusters=3, sample_pixels=500))
     prepared['review'] = review.ClusterReview.from_prepared(prepared)
-    target = report.export_report(prepared, Path.cwd() / 'report.html')
+    target = report.export_report(prepared, Path.cwd() / 'report.html', export_metrics=True)
     html = Path(target).read_text(encoding='utf-8')
     assert 'data:image/' in html and '${fig' not in html
     assert Path.cwd().joinpath('report-output/metrics/group_summary.csv').is_file()

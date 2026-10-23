@@ -15,6 +15,47 @@ from riima import viewer
 from test_riima_review import prepared_dataset
 
 
+def test_report_and_similarity_follow_sparse_current_catalog_after_resume(tmp_path):
+    from riima import report, report_data
+    prepared = prepared_dataset(tmp_path, count=1)
+    state = prepared['review']
+    raw = prepared['optical']['labels'].copy()
+    centers = state.centers.copy()
+    retired = state.create_group('Categoria removida')
+    state.delete_group(retired)
+    created = state.create_group('Categoria <nova>', (17, 39, 63))
+    state.rename_group(0, 'Material atual')
+    archive = tmp_path / 'catalog.riima'
+    review.save_project(prepared, archive)
+    restored = review.load_project(archive)
+    data = report_data.collect_report_data(restored)
+    assert [group['id'] for group in data['groups']] == [0, 1, created]
+    assert [data['groups'][i]['id'] for i in data['active']] == [0, 1]
+    empty = data['groups'][-1]
+    assert empty['pixels'] == empty['components_measured'] == 0
+    assert np.isnan(empty['component_area_median_px'])
+    assert np.isnan(empty['mean_anisotropy'])
+    html = report.export_report(restored, tmp_path / 'current.html').read_text(encoding='utf-8')
+    assert 'Material atual' in html and 'Categoria &lt;nova&gt;' in html
+    assert 'Categoria removida' not in html
+    assert '#11273f' in html
+    np.testing.assert_array_equal(restored['optical']['labels'], raw)
+    np.testing.assert_array_equal(restored['review'].centers, centers)
+
+
+def test_group_rename_and_color_leave_similarity_values_unchanged(tmp_path):
+    from riima import report_data
+    prepared = prepared_dataset(tmp_path, count=1)
+    before = report_data.collect_report_data(prepared, sample_per_group=17)
+    state = prepared['review']
+    state.rename_group(0, 'Nome atual')
+    state.recolor_group(0, (17, 39, 63))
+    after = report_data.collect_report_data(prepared, sample_per_group=17)
+    assert after['groups'][0]['name'] == 'Nome atual'
+    for key in ('profile', 'z', 'similarity', 'linkage'):
+        np.testing.assert_allclose(after[key], before[key], rtol=0, atol=0, equal_nan=True)
+
+
 def test_standardization_keeps_missing_values_and_does_not_rank_constants():
     from riima.report_data import standardize
     z, varying = standardize(np.array([[1, 5, np.nan], [3, 5, 4]], float))
@@ -106,7 +147,7 @@ def test_report_of_resumed_registered_views_has_one_final_map_and_all_optical_at
     active = Path(resumed['output'])
     assert active == tmp_path / 'registered_output'
     assert resumed['output_history'] == [str(historical)]
-    target = report.export_report(resumed, tmp_path / 'registered.html')
+    target = report.export_report(resumed, tmp_path / 'registered.html', export_metrics=True)
     html = target.read_text(encoding='utf-8')
     parser = ImagesInReport()
     parser.feed(html)
@@ -195,3 +236,78 @@ def test_pending_report_and_failed_write_keep_existing_report(tmp_path, monkeypa
         report.export_report(prepared, existing)
     assert existing.read_text(encoding='utf-8') == 'previous export'
     assert not list(tmp_path.glob('.riima-report-*'))
+
+
+def test_report_default_publishes_only_html_and_preserves_existing_metrics(tmp_path):
+    from riima import report
+    prepared = prepared_dataset(tmp_path, count=1)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    target = tmp_path / 'portable.html'
+    report.export_report(prepared, target)
+    after = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert set(after) - set(before) == {Path('portable.html')}
+    assert all(after[name] == content for name, content in before.items())
+    assert 'id="similaridade"' in target.read_text(encoding='utf-8')
+    folder = metrics.export_metrics(prepared)
+    previous = {p.relative_to(folder): p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+    prepared['interpretation'].rename_cluster(0, 'Current live name')
+    report.export_report(prepared, target)
+    assert {p.relative_to(folder): p.read_bytes() for p in folder.rglob('*') if p.is_file()} == previous
+    assert 'Current live name' in target.read_text(encoding='utf-8')
+
+
+def test_in_memory_profiles_and_similarity_equal_csv_reference_without_files(tmp_path):
+    from riima import report_data
+    prepared = prepared_dataset(tmp_path)
+    assert callable(getattr(report_data, 'collect_report_data', None)), 'similarity needs in-memory input'
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    data = report_data.collect_report_data(prepared, sample_per_group=17, min_area=2, max_regions=3)
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()} == before
+    reference = report_data.load_metrics(metrics.export_metrics(
+        prepared, tmp_path / 'csv-reference', sample_per_group=17, min_area=2, max_regions=3))
+    for key in ('profile', 'z', 'varying', 'similarity', 'linkage'):
+        np.testing.assert_allclose(data[key], reference[key], rtol=0, atol=0, equal_nan=True)
+    for key in ('active', 'order', 'columns', 'features', 'images', 'valid_pixels', 'descriptors'):
+        assert data[key] == reference[key]
+    assert data['similarity'][0, 1] == pytest.approx(np.exp(-.5))
+
+
+def test_in_memory_similarity_handles_background_empty_and_merged_groups(tmp_path):
+    from riima import report_data
+    prepared = prepared_dataset(tmp_path, count=1)
+    state = prepared['review']
+    assert callable(getattr(report_data, 'collect_report_data', None)), 'similarity needs in-memory input'
+    original = report_data.collect_report_data(prepared)
+    prepared['interpretation'].rename_cluster(0, 'Presentation only')
+    state.palette[0] = (17, 25, 33)
+    state.selected_cluster = 1
+    renamed = report_data.collect_report_data(prepared)
+    assert renamed['groups'][0]['name'] == 'Presentation only'
+    for key in ('profile', 'similarity', 'linkage'):
+        np.testing.assert_allclose(renamed[key], original[key], rtol=0, atol=0, equal_nan=True)
+    state.exclude(0, [195], True)
+    state.refine_pending()
+    excluded = report_data.collect_report_data(prepared)
+    assert excluded['valid_pixels'] == original['valid_pixels'] - 1
+    assert sum(g['pixels'] for g in excluded['groups']) == 16 * 24 - 1
+    assert not np.array_equal(excluded['profile'], original['profile'], equal_nan=True)
+    state.exclude(0, [195], False)
+    state.refine_pending()
+    restored = report_data.collect_report_data(prepared)
+    for key in ('profile', 'similarity', 'linkage'):
+        np.testing.assert_allclose(restored[key], original[key], rtol=0, atol=0, equal_nan=True)
+    state.background_groups.add(1)
+    data = report_data.collect_report_data(prepared)
+    assert [data['groups'][i]['id'] for i in data['active']] == [0]
+    np.testing.assert_array_equal(data['similarity'], [[1.]])
+    state.background_groups.clear()
+    prepared['interpretation'].merge_clusters([0, 1])
+    state.sync_groups(prepared['interpretation'].groups)
+    data = report_data.collect_report_data(prepared)
+    assert data['groups'][0]['pixels'] == 16 * 24
+    assert len(data['groups']) == 1
+    state.items[0]['labels'].fill(-1)
+    empty = report_data.collect_report_data(prepared)
+    assert empty['active'] == []
+    assert empty['similarity'].shape == (0, 0)
+    assert empty['linkage'].shape == (0, 4)
